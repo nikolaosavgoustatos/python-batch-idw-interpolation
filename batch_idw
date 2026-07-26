@@ -1,0 +1,405 @@
+"""
+Batch IDW interpolation with percentile-based classified symbology.
+Classes: min -> 5th -> 25th -> 50th -> 75th -> 90th -> 95th -> max (7 classes).
+Color ramp: RdYlBu-7 (red at high values). All break values rounded integers.
+
+Set RUN_IDW = False to re-apply symbology only on existing layers/rasters.
+Run inside ArcGIS Pro (CURRENT project must be open).
+"""
+
+import arcpy
+import json
+import math
+import os
+import traceback
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Inputs and parameters
+# ---------------------------------------------------------------------------
+IN_POINTS = "As mg/kg"
+Z_FIELDS = [
+    "As", "Ba", "Ca", "Cr", "Cu", "Fe", "Mn", "Ni",
+    "Pb", "Rb", "Sr", "Ti", "V", "Zn",
+]
+OUT_FOLDER = r"C:\Users\nick\Desktop\arcgis_pro_prjects\ANDOS_AVGOUSTATOS\outputraster"
+OUT_CELL_SIZE = 50
+POWER = 2
+SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
+IN_BARRIER = ""
+PERCENTILES = [5, 25, 50, 75, 90, 95]
+NUM_CLASSES = 7
+
+# True = run IDW + symbology. False = fix symbology on existing rasters/layers only.
+RUN_IDW = False
+
+# ColorBrewer RdYlBu 7-class, reversed so high values render red
+RDYLBU_7_HEX = ["#d73027", "#fc8d59", "#fee090", "#ffffbf", "#e0f3f8", "#91bfdb", "#4575b4"]
+CLASS_COLORS_LOW_TO_HIGH = list(reversed(RDYLBU_7_HEX))
+
+
+def hex_to_rgb(hex_color):
+    value = hex_color.lstrip("#")
+    return [int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16), 100]
+
+
+def make_cim_color(hex_color):
+    r, g, b, a = hex_to_rgb(hex_color)
+    color = arcpy.cim.CreateCIMObjectFromClassName("CIMRGBColor", "V2")
+    color.values = [r, g, b, a]
+    color.colorSpace = arcpy.cim.CreateCIMObjectFromClassName("CIMICCColorSpace", "V2")
+    color.colorSpace.url = "Default RGB profile"
+    return color
+
+
+def raster_path_for_field(field):
+    return os.path.join(OUT_FOLDER, f"IDW_{field}.tif")
+
+
+def breaks_json_path():
+    return os.path.join(OUT_FOLDER, "idw_breaks.json")
+
+
+def get_percentile_breaks_from_points(points_fc, field, pct_list):
+    """Build 8 break points (7 classes) from sample points."""
+    vals = []
+    with arcpy.da.SearchCursor(points_fc, [field]) as cursor:
+        for row in cursor:
+            if row[0] is not None:
+                vals.append(row[0])
+
+    if not vals:
+        raise ValueError(f"No valid values found for field '{field}' in {points_fc}.")
+
+    arr = np.array(vals, dtype=float)
+   
+    # 1. Minimum: Always round down (floor)
+    breaks = [math.floor(float(np.min(arr)))]
+   
+    # 2. Percentiles: Standard round half up
+    for p in pct_list:
+        v = float(np.percentile(arr, p))
+        breaks.append(int(math.floor(v + 0.5)))
+       
+    # 3. Maximum: Always round up (ceil)
+    breaks.append(math.ceil(float(np.max(arr))))
+
+    # Ensure classes are strictly increasing
+    for i in range(1, len(breaks)):
+        if breaks[i] <= breaks[i - 1]:
+            breaks[i] = breaks[i - 1] + 1
+
+    return breaks
+
+
+def load_or_compute_breaks(field):
+    breaks_file = breaks_json_path()
+    if os.path.exists(breaks_file):
+        with open(breaks_file, "r", encoding="utf-8") as handle:
+            all_breaks = json.load(handle)
+        if field in all_breaks:
+            return all_breaks[field]
+
+    return get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
+
+
+def save_breaks(all_breaks):
+    with open(breaks_json_path(), "w", encoding="utf-8") as handle:
+        json.dump(all_breaks, handle, indent=2)
+
+
+def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
+    """Mutate an existing CIMRasterClassifyColorizer to lock in the manual breaks
+    without breaking the UI dropdowns in ArcGIS Pro."""
+    upper_values = breaks[1:]
+    if len(upper_values) != len(hex_colors):
+        raise RuntimeError(
+            f"Break count ({len(upper_values)}) does not match color count ({len(hex_colors)})."
+        )
+
+    class_breaks = []
+    lower = int(breaks[0])
+   
+    for i, upper in enumerate(upper_values):
+        upper_int = int(upper)
+        class_break = arcpy.cim.CreateCIMObjectFromClassName(
+            "CIMRasterClassBreak", "V2"
+        )
+       
+        class_break.upperBound = float(upper_int)
+       
+        # Explicit integer label formatting
+        class_break.label = f"{int(lower)} - {upper_int}"
+       
+        class_break.color = make_cim_color(hex_colors[i])
+        class_breaks.append(class_break)
+        lower = upper_int
+   
+    colorizer.resamplingType = "BilinearInterpolation"
+    colorizer.classificationMethod = "Manual"
+    colorizer.field = "VALUE"
+   
+    colorizer.minimumBreak = float(int(breaks[0]))
+    colorizer.showInAscendingOrder = True
+    colorizer.classBreaks = class_breaks
+   
+    # Enforce 0 decimal places at the colorizer level so Pro doesn't append .00000
+    num_format = arcpy.cim.CreateCIMObjectFromClassName("CIMNumericFormat", "V2")
+    num_format.roundingOption = "esriRoundNumberOfDecimals"
+    num_format.roundingValue = 0
+    colorizer.numberFormat = num_format
+
+
+def get_class_break_count(colorizer):
+    breaks = getattr(colorizer, "classBreaks", None)
+    if breaks is not None:
+        return len(breaks)
+    breaks = getattr(colorizer, "colorClassBreaks", None)
+    if breaks is not None:
+        return len(breaks)
+    return 0
+
+
+def is_classified(layer):
+    colorizer = layer.getDefinition("V2").colorizer
+    if colorizer is None:
+        return False
+    if type(colorizer).__name__ != "CIMRasterClassifyColorizer":
+        return False
+    return get_class_break_count(colorizer) == NUM_CLASSES
+
+
+def find_map_layer(active_map, layer_name):
+    for layer in active_map.listLayers():
+        if layer.name == layer_name and layer.isRasterLayer:
+            return layer
+    return None
+
+
+def ensure_layer_on_map(active_map, field, raster_path):
+    layer_name = f"IDW_{field}"
+    layer = find_map_layer(active_map, layer_name)
+    if layer:
+        return layer
+
+    layer = active_map.addDataFromPath(raster_path)
+    if isinstance(layer, list):
+        layer = layer[0]
+    if not layer:
+        raise RuntimeError(f"Could not add {raster_path} to the map.")
+
+    layer.name = layer_name
+    layer.visible = False
+    return layer
+
+
+def apply_classified_symbology(layer, breaks):
+    """Apply classify symbology by setting the arcpy.mp properties first
+    (to link the UI), and then overriding with our precise CIM settings."""
+   
+    # 1. Update basic arcpy.mp symbology first so the UI color ramp drop-down populates.
+    aprx = arcpy.mp.ArcGISProject("CURRENT")
+    sym = layer.symbology
+    if hasattr(sym, 'colorizer'):
+        if sym.colorizer.type != 'RasterClassifyColorizer':
+            sym.updateColorizer('RasterClassifyColorizer')
+       
+        # Explicitly force the method to Manual here to properly bind the UI
+        sym.colorizer.classificationMethod = 'Manual'
+        sym.colorizer.breakCount = NUM_CLASSES
+       
+        ramps = aprx.listColorRamps("Red-Yellow-Blue (7 Classes)")
+        if ramps:
+            sym.colorizer.colorRamp = ramps[0]
+       
+        layer.symbology = sym
+
+    # 2. Pull the newly established CIM definition and MUTATE its properties.
+    # This prevents the Symbology pane from forgetting the "Manual" state.
+    cim_layer = layer.getDefinition("V2")
+   
+    if cim_layer.colorizer is None:
+        cim_layer.colorizer = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassifyColorizer", "V2")
+       
+    update_classify_colorizer_cim(cim_layer.colorizer, breaks, CLASS_COLORS_LOW_TO_HIGH)
+   
+    # Ensure collapsed in TOC
+    cim_layer.expanded = False
+   
+    layer.setDefinition(cim_layer)
+    layer.visible = False
+
+
+def apply_symbology_for_field(active_map, field, breaks):
+    raster_path = raster_path_for_field(field)
+    layer_name = f"IDW_{field}"
+
+    if not os.path.exists(raster_path):
+        raise FileNotFoundError(f"Missing raster: {raster_path}")
+
+    try:
+        arcpy.management.CalculateStatistics(raster_path)
+    except Exception:
+        pass
+
+    layer = ensure_layer_on_map(active_map, field, raster_path)
+    apply_classified_symbology(layer, breaks)
+
+    if not is_classified(layer):
+        apply_classified_symbology(layer, breaks)
+
+    return layer, is_classified(layer)
+
+
+def run_idw_for_field(field):
+    print(f"Running IDW for {field}...")
+    breaks = get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
+    print(f"  Breaks: {breaks}")
+
+    out_idw = arcpy.sa.Idw(
+        in_point_features=IN_POINTS,
+        z_field=field,
+        cell_size=OUT_CELL_SIZE,
+        power=POWER,
+        search_radius=SEARCH_RADIUS,
+        in_barrier_polyline_features=IN_BARRIER,
+    )
+
+    out_path = raster_path_for_field(field)
+    out_idw.save(out_path)
+    print(f"  Saved: {os.path.basename(out_path)}")
+
+    try:
+        arcpy.management.CalculateStatistics(out_path)
+    except Exception as exc:
+        print(f"  WARNING: CalculateStatistics failed: {exc}")
+
+    return breaks
+
+
+def apply_symbology_pass(active_map, breaks_by_field):
+    print("\nApplying classified symbology to all layers...")
+    failed = []
+
+    for field in Z_FIELDS:
+        layer_name = f"IDW_{field}"
+        try:
+            breaks = breaks_by_field[field]
+            layer, ok = apply_symbology_for_field(active_map, field, breaks)
+            status = "OK" if ok else "STILL STRETCH"
+            print(f"  {layer_name}: {status}")
+            if not ok:
+                failed.append(field)
+        except Exception as exc:
+            print(f"  {layer_name}: ERROR - {exc}")
+            traceback.print_exc()
+            failed.append(field)
+
+    return failed
+
+
+def fix_reverted_layers(active_map, breaks_by_field):
+    """Second pass: ArcGIS sometimes reverts earlier layers to stretch while batch runs."""
+    print("\nFix pass for layers that reverted to stretch...")
+    fixed_any = False
+    failed = []
+
+    aprx = arcpy.mp.ArcGISProject("CURRENT")
+    if aprx.activeView:
+        try:
+            aprx.activeView.refresh()
+        except AttributeError:
+            pass
+
+    for field in Z_FIELDS:
+        layer_name = f"IDW_{field}"
+        layer = find_map_layer(active_map, layer_name)
+        if not layer:
+            continue
+        if is_classified(layer):
+            continue
+
+        fixed_any = True
+        print(f"  Re-applying classify to {layer_name}...")
+        try:
+            _, ok = apply_symbology_for_field(active_map, field, breaks_by_field[field])
+            if not ok:
+                failed.append(field)
+        except Exception as exc:
+            print(f"  {layer_name}: ERROR - {exc}")
+            failed.append(field)
+
+    if not fixed_any:
+        print("  All layers already classified.")
+    return failed
+
+
+def main():
+    os.makedirs(OUT_FOLDER, exist_ok=True)
+
+    aprx = arcpy.mp.ArcGISProject("CURRENT")
+    active_map = aprx.activeMap
+    if not active_map:
+        raise RuntimeError("No active map found in the CURRENT project.")
+
+    env_kwargs = {
+        "overwriteOutput": True,
+        "addOutputsToMap": False,
+        "extent": "andros_gys",
+        "cellSize": None,
+        "cellSizeProjectionMethod": "CONVERT_UNITS",
+        "mask": "andros_municipality_community",
+        "snapRaster": None,
+        "tileSize": "128 128",
+        "compression": "LZW",
+        "outputCoordinateSystem": active_map.spatialReference,
+    }
+
+    arcpy.CheckOutExtension("Spatial")
+    failed_fields = []
+
+    try:
+        breaks_by_field = {}
+
+        with arcpy.EnvManager(**env_kwargs):
+            if RUN_IDW:
+                print("Phase 1: IDW interpolation...")
+                for field in Z_FIELDS:
+                    try:
+                        breaks_by_field[field] = run_idw_for_field(field)
+                    except Exception as exc:
+                        print(f"  ERROR in IDW for {field}: {exc}")
+                        traceback.print_exc()
+                        failed_fields.append(field)
+                save_breaks(breaks_by_field)
+            else:
+                print("Phase 1 skipped (RUN_IDW = False).")
+                for field in Z_FIELDS:
+                    breaks_by_field[field] = load_or_compute_breaks(field)
+
+            failed_symbology = apply_symbology_pass(active_map, breaks_by_field)
+            failed_fix = fix_reverted_layers(active_map, breaks_by_field)
+
+            if aprx.activeView:
+                try:
+                    aprx.activeView.refresh()
+                except AttributeError:
+                    pass
+            try:
+                aprx.save()
+            except Exception:
+                pass
+
+        failed_fields = sorted(set(failed_fields + failed_symbology + failed_fix))
+        if failed_fields:
+            print(f"\nFields needing attention: {failed_fields}")
+        else:
+            print("\nAll fields classified successfully.")
+        print("Done.")
+    finally:
+        arcpy.CheckInExtension("Spatial")
+
+
+if __name__ == "__main__":
+    main()
