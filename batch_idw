@@ -1,8 +1,8 @@
 """
 Batch IDW interpolation with percentile-based classified symbology.
 Classes: min -> 5th -> 25th -> 50th -> 75th -> 90th -> 95th -> max (7 classes).
-Color ramp: RdYlBu-7 (red at high values). All break values rounded integers,
-except the max class which keeps its exact value (label is rounded for display).
+Color ramp: RdYlBu-7 (red at high values). Break values are exact/unrounded;
+only the displayed labels are rounded up (ceiling) to integers.
 
 Set RUN_IDW = False to re-apply symbology only on existing layers/rasters.
 Run inside ArcGIS Pro (CURRENT project must be open).
@@ -63,7 +63,11 @@ def breaks_json_path():
 
 
 def get_percentile_breaks_from_points(points_fc, field, pct_list):
-    """Build 8 break points (7 classes) from sample points."""
+    """Build 8 break points (7 classes) from sample points.
+
+    All values (min, percentiles, max) are kept exact/unrounded floats.
+    Rounding is applied ONLY at label-display time, not here.
+    """
     vals = []
     with arcpy.da.SearchCursor(points_fc, [field]) as cursor:
         for row in cursor:
@@ -75,23 +79,21 @@ def get_percentile_breaks_from_points(points_fc, field, pct_list):
 
     arr = np.array(vals, dtype=float)
 
-    # 1. Minimum: normal round half up (value)
-    min_val = float(np.min(arr))
-    breaks = [int(math.floor(min_val + 0.5))]
+    # 1. Minimum: exact value, no rounding
+    breaks = [float(np.min(arr))]
 
-    # 2. Percentiles: normal round half up (value)
+    # 2. Percentiles: exact values, no rounding
     for p in pct_list:
         v = float(np.percentile(arr, p))
-        breaks.append(int(math.floor(v + 0.5)))
+        breaks.append(v)
 
-    # 3. Maximum: keep EXACT actual max value (no rounding in value).
-    # Rounding for display only happens later, in the label.
+    # 3. Maximum: exact value, no rounding
     breaks.append(float(np.max(arr)))
 
     # Ensure classes are strictly increasing
     for i in range(1, len(breaks)):
         if breaks[i] <= breaks[i - 1]:
-            breaks[i] = breaks[i - 1] + 1
+            breaks[i] = breaks[i - 1] + 1e-6
 
     return breaks
 
@@ -114,7 +116,14 @@ def save_breaks(all_breaks):
 
 def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
     """Mutate an existing CIMRasterClassifyColorizer to lock in the manual breaks
-    without breaking the UI dropdowns in ArcGIS Pro."""
+    without breaking the UI dropdowns in ArcGIS Pro.
+
+    Break VALUES (used for classification) are kept exact/unrounded, exactly
+    as computed in get_percentile_breaks_from_points.
+
+    Break LABELS (display text only) always show the rounded-UP (ceiling)
+    integer, for every class boundary including the first (min) and the max.
+    """
     upper_values = breaks[1:]
     if len(upper_values) != len(hex_colors):
         raise RuntimeError(
@@ -122,39 +131,34 @@ def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
         )
 
     class_breaks = []
-    lower = int(breaks[0])
-    last_index = len(upper_values) - 1
+    lower_value = float(breaks[0])
+    lower_label = math.ceil(lower_value)
 
     for i, upper in enumerate(upper_values):
         class_break = arcpy.cim.CreateCIMObjectFromClassName(
             "CIMRasterClassBreak", "V2"
         )
 
-        if i == last_index:
-            # Max class: keep the exact actual max value for the real break/value.
-            upper_exact = float(upper)
-            class_break.upperBound = upper_exact
-            # Label only: normal round half up, integer display.
-            upper_label = int(math.floor(upper_exact + 0.5))
-        else:
-            upper_exact = int(upper)
-            class_break.upperBound = float(upper_exact)
-            upper_label = upper_exact
+        upper_value = float(upper)
+        upper_label = math.ceil(upper_value)
 
-        class_break.label = f"{int(lower)} - {upper_label}"
+        # Actual classification value: exact/unrounded.
+        class_break.upperBound = upper_value
+
+        # Display label: always rounded UP (ceiling) integers.
+        class_break.label = f"{int(lower_label)} - {int(upper_label)}"
 
         class_break.color = make_cim_color(hex_colors[i])
         class_breaks.append(class_break)
 
-        # Track the lower bound for the next label using the same value
-        # used for this break's upper bound (exact for max, int otherwise).
-        lower = upper_label
+        lower_value = upper_value
+        lower_label = upper_label
 
     colorizer.resamplingType = "BilinearInterpolation"
     colorizer.classificationMethod = "Manual"
     colorizer.field = "VALUE"
 
-    colorizer.minimumBreak = float(int(breaks[0]))
+    colorizer.minimumBreak = float(breaks[0])
     colorizer.showInAscendingOrder = True
     colorizer.classBreaks = class_breaks
 
