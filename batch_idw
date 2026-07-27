@@ -1,7 +1,8 @@
 """
 Batch IDW interpolation with percentile-based classified symbology.
 Classes: min -> 5th -> 25th -> 50th -> 75th -> 90th -> 95th -> max (7 classes).
-Color ramp: RdYlBu-7 (red at high values). All break values rounded integers.
+Color ramp: RdYlBu-7 (red at high values). All break values rounded integers,
+except the max class which keeps its exact value (label is rounded for display).
 
 Set RUN_IDW = False to re-apply symbology only on existing layers/rasters.
 Run inside ArcGIS Pro (CURRENT project must be open).
@@ -73,17 +74,19 @@ def get_percentile_breaks_from_points(points_fc, field, pct_list):
         raise ValueError(f"No valid values found for field '{field}' in {points_fc}.")
 
     arr = np.array(vals, dtype=float)
-   
-    # 1. Minimum: Always round down (floor)
-    breaks = [math.floor(float(np.min(arr)))]
-   
-    # 2. Percentiles: Standard round half up
+
+    # 1. Minimum: normal round half up (value)
+    min_val = float(np.min(arr))
+    breaks = [int(math.floor(min_val + 0.5))]
+
+    # 2. Percentiles: normal round half up (value)
     for p in pct_list:
         v = float(np.percentile(arr, p))
         breaks.append(int(math.floor(v + 0.5)))
-       
-    # 3. Maximum: Always round up (ceil)
-    breaks.append(math.ceil(float(np.max(arr))))
+
+    # 3. Maximum: keep EXACT actual max value (no rounding in value).
+    # Rounding for display only happens later, in the label.
+    breaks.append(float(np.max(arr)))
 
     # Ensure classes are strictly increasing
     for i in range(1, len(breaks)):
@@ -120,30 +123,41 @@ def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
 
     class_breaks = []
     lower = int(breaks[0])
-   
+    last_index = len(upper_values) - 1
+
     for i, upper in enumerate(upper_values):
-        upper_int = int(upper)
         class_break = arcpy.cim.CreateCIMObjectFromClassName(
             "CIMRasterClassBreak", "V2"
         )
-       
-        class_break.upperBound = float(upper_int)
-       
-        # Explicit integer label formatting
-        class_break.label = f"{int(lower)} - {upper_int}"
-       
+
+        if i == last_index:
+            # Max class: keep the exact actual max value for the real break/value.
+            upper_exact = float(upper)
+            class_break.upperBound = upper_exact
+            # Label only: normal round half up, integer display.
+            upper_label = int(math.floor(upper_exact + 0.5))
+        else:
+            upper_exact = int(upper)
+            class_break.upperBound = float(upper_exact)
+            upper_label = upper_exact
+
+        class_break.label = f"{int(lower)} - {upper_label}"
+
         class_break.color = make_cim_color(hex_colors[i])
         class_breaks.append(class_break)
-        lower = upper_int
-   
+
+        # Track the lower bound for the next label using the same value
+        # used for this break's upper bound (exact for max, int otherwise).
+        lower = upper_label
+
     colorizer.resamplingType = "BilinearInterpolation"
     colorizer.classificationMethod = "Manual"
     colorizer.field = "VALUE"
-   
+
     colorizer.minimumBreak = float(int(breaks[0]))
     colorizer.showInAscendingOrder = True
     colorizer.classBreaks = class_breaks
-   
+
     # Enforce 0 decimal places at the colorizer level so Pro doesn't append .00000
     num_format = arcpy.cim.CreateCIMObjectFromClassName("CIMNumericFormat", "V2")
     num_format.roundingOption = "esriRoundNumberOfDecimals"
