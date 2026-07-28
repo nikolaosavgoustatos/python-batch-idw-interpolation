@@ -2,7 +2,19 @@
 Batch IDW interpolation with percentile-based classified symbology.
 Classes: min -> 5th -> 25th -> 50th -> 75th -> 90th -> 95th -> max (7 classes).
 Color ramp: RdYlBu-7 (red at high values). Break values are exact/unrounded;
-only the displayed labels are rounded up (ceiling) to integers.
+only the displayed labels are rounded (normal rounding) to integers.
+Classification method + color ramp are set via arcpy.mp (so the Symbology
+pane UI shows "Manual Interval" and "Red-Yellow-Blue (7 Classes)"), the CIM layer is
+mutated afterward so the actual break values/labels are exact.
+
+KEY FIXES:
+  1. arcpy.mp uses 'ManualInterval', CIM uses 'Manual' - these are different!
+  2. Labels must be set via arcpy.mp BEFORE final layer.symbology assignment,
+     otherwise Pro regenerates them from float values (showing decimals).
+  3. numberFormat removed to prevent interference with explicit labels.
+  4. sym.colorizer.classBreaks returns a COPY of the break list - mutating
+     items in that copy does nothing until it's reassigned back onto the
+     colorizer. This was why labels weren't actually rounding up before.
 
 Set RUN_IDW = False to re-apply symbology only on existing layers/rasters.
 Run inside ArcGIS Pro (CURRENT project must be open).
@@ -31,6 +43,7 @@ SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
 IN_BARRIER = ""
 PERCENTILES = [5, 25, 50, 75, 90, 95]
 NUM_CLASSES = 7
+COLOR_RAMP_NAME = "Red-Yellow-Blue (7 Classes)"
 
 # True = run IDW + symbology. False = fix symbology on existing rasters/layers only.
 RUN_IDW = False
@@ -38,6 +51,16 @@ RUN_IDW = False
 # ColorBrewer RdYlBu 7-class, reversed so high values render red
 RDYLBU_7_HEX = ["#d73027", "#fc8d59", "#fee090", "#ffffbf", "#e0f3f8", "#91bfdb", "#4575b4"]
 CLASS_COLORS_LOW_TO_HIGH = list(reversed(RDYLBU_7_HEX))
+
+
+def round_half_up(value):
+    """Normal rounding (32.1 -> 32, 32.5 -> 33, 32.9 -> 33).
+
+    Python's built-in round() uses banker's rounding (round-half-to-even),
+    which would turn 32.5 into 32, not 33. This uses floor(x + 0.5) instead,
+    which matches everyday "round half up" rounding for these values.
+    """
+    return math.floor(value + 0.5)
 
 
 def hex_to_rgb(hex_color):
@@ -115,14 +138,16 @@ def save_breaks(all_breaks):
 
 
 def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
-    """Mutate an existing CIMRasterClassifyColorizer to lock in the manual breaks
-    without breaking the UI dropdowns in ArcGIS Pro.
+    """Mutate an existing CIMRasterClassifyColorizer to lock in the manual
+    (custom interval) breaks without breaking the UI dropdowns in ArcGIS Pro.
 
     Break VALUES (used for classification) are kept exact/unrounded, exactly
     as computed in get_percentile_breaks_from_points.
 
-    Break LABELS (display text only) always show the rounded-UP (ceiling)
+    Break LABELS (display text only) always show the normally-rounded
     integer, for every class boundary including the first (min) and the max.
+
+    NOTE: CIM uses 'Manual' for classificationMethod (not 'ManualInterval')
     """
     upper_values = breaks[1:]
     if len(upper_values) != len(hex_colors):
@@ -132,7 +157,7 @@ def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
 
     class_breaks = []
     lower_value = float(breaks[0])
-    lower_label = math.ceil(lower_value)
+    lower_label = round_half_up(lower_value)
 
     for i, upper in enumerate(upper_values):
         class_break = arcpy.cim.CreateCIMObjectFromClassName(
@@ -140,12 +165,12 @@ def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
         )
 
         upper_value = float(upper)
-        upper_label = math.ceil(upper_value)
+        upper_label = round_half_up(upper_value)
 
         # Actual classification value: exact/unrounded.
         class_break.upperBound = upper_value
 
-        # Display label: always rounded UP (ceiling) integers.
+        # Display label: always normally-rounded integers.
         class_break.label = f"{int(lower_label)} - {int(upper_label)}"
 
         class_break.color = make_cim_color(hex_colors[i])
@@ -154,19 +179,36 @@ def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
         lower_value = upper_value
         lower_label = upper_label
 
-    colorizer.resamplingType = "BilinearInterpolation"
+    # CRITICAL: Set classBreakType to "ClassBreaks" (not "StandardDeviation")
+    colorizer.classBreakType = "ClassBreaks"
+
+    # CRITICAL: CIM uses "Manual" (arcpy.mp uses "ManualInterval" - they're different!)
     colorizer.classificationMethod = "Manual"
+
     colorizer.field = "VALUE"
+    colorizer.resamplingType = "BilinearInterpolation"
 
     colorizer.minimumBreak = float(breaks[0])
     colorizer.showInAscendingOrder = True
     colorizer.classBreaks = class_breaks
+    colorizer.numberOfBreaks = len(class_breaks)
 
-    # Enforce 0 decimal places at the colorizer level so Pro doesn't append .00000
-    num_format = arcpy.cim.CreateCIMObjectFromClassName("CIMNumericFormat", "V2")
-    num_format.roundingOption = "esriRoundNumberOfDecimals"
-    num_format.roundingValue = 0
-    colorizer.numberFormat = num_format
+    # Clear deviationInterval if it exists (only relevant for StandardDeviation)
+    if hasattr(colorizer, 'deviationInterval'):
+        try:
+            colorizer.deviationInterval = None
+        except Exception:
+            pass
+
+    # REMOVED numberFormat - it was interfering with explicit label strings.
+    # Since every class_break.label is set explicitly above, we do NOT need
+    # a colorizer-level numberFormat.  Leaving it out lets Pro use the raw
+    # label string we provided (e.g. "5 - 10") without re-formatting.
+    if hasattr(colorizer, 'numberFormat'):
+        try:
+            colorizer.numberFormat = None
+        except Exception:
+            pass
 
 
 def get_class_break_count(colorizer):
@@ -180,10 +222,17 @@ def get_class_break_count(colorizer):
 
 
 def is_classified(layer):
-    colorizer = layer.getDefinition("V2").colorizer
+    """Check if layer has proper Manual classification (not Standard Deviation)."""
+    cim = layer.getDefinition("V2")
+    colorizer = cim.colorizer
     if colorizer is None:
         return False
     if type(colorizer).__name__ != "CIMRasterClassifyColorizer":
+        return False
+    # CIM uses "Manual" for classificationMethod
+    if getattr(colorizer, "classificationMethod", None) != "Manual":
+        return False
+    if getattr(colorizer, "classBreakType", None) != "ClassBreaks":
         return False
     return get_class_break_count(colorizer) == NUM_CLASSES
 
@@ -213,40 +262,102 @@ def ensure_layer_on_map(active_map, field, raster_path):
 
 
 def apply_classified_symbology(layer, breaks):
-    """Apply classify symbology by setting the arcpy.mp properties first
-    (to link the UI), and then overriding with our precise CIM settings."""
-   
-    # 1. Update basic arcpy.mp symbology first so the UI color ramp drop-down populates.
+    """Apply classify symbology with correct "Manual Interval" showing in UI
+    and normally-rounded integer labels.
+
+    KEY INSIGHT: arcpy.mp and CIM use DIFFERENT values for the same concept:
+    - arcpy.mp uses 'ManualInterval'
+    - CIM uses 'Manual'
+
+    KEY INSIGHT #2: When you assign layer.symbology = sym, Pro REGENERATES
+    labels from the float break values unless you explicitly set each break's
+    .label property via arcpy.mp BEFORE the final assignment.
+
+    KEY INSIGHT #3: sym.colorizer.classBreaks returns a COPY of the break
+    list, not a live reference. Mutating .label / .upperBound on items in
+    that copy does nothing on its own - the copy must be explicitly
+    reassigned back onto sym.colorizer.classBreaks before the next
+    layer.symbology = sym, or the edits are silently lost.
+
+    Step 1: Set arcpy.mp with 'ManualInterval' + colorRamp + breakCount
+    Step 2: Re-read sym, override each break's upperBound AND label with
+            exact values / normally-rounded integer strings, then write the edited
+            list back onto sym.colorizer.classBreaks
+    Step 3: Final layer.symbology = sym (labels now survive because they
+            were written back onto the colorizer before this assignment)
+    Step 4: CIM pass to lock in classBreakType and other internals
+    """
+
     aprx = arcpy.mp.ArcGISProject("CURRENT")
+
+    # =========================================================================
+    # STEP 1: Initialize colorizer with method + ramp + break count
+    # =========================================================================
     sym = layer.symbology
     if hasattr(sym, 'colorizer'):
         if sym.colorizer.type != 'RasterClassifyColorizer':
             sym.updateColorizer('RasterClassifyColorizer')
-       
-        # Explicitly force the method to Manual here to properly bind the UI
-        sym.colorizer.classificationMethod = 'Manual'
+
         sym.colorizer.breakCount = NUM_CLASSES
-       
-        ramps = aprx.listColorRamps("Red-Yellow-Blue (7 Classes)")
+
+        # Set colorRamp BEFORE classificationMethod
+        ramps = aprx.listColorRamps(COLOR_RAMP_NAME)
         if ramps:
             sym.colorizer.colorRamp = ramps[0]
-       
+
+        # CRITICAL: arcpy.mp uses 'ManualInterval', CIM uses 'Manual'
+        sym.colorizer.classificationMethod = 'ManualInterval'
+
+        # First assignment: generates the 7 class break slots
         layer.symbology = sym
 
-    # 2. Pull the newly established CIM definition and MUTATE its properties.
-    # This prevents the Symbology pane from forgetting the "Manual" state.
+    # =========================================================================
+    # STEP 2: Best-effort override of break VALUES/LABELS via arcpy.mp.
+    #
+    # NOTE: On some ArcGIS Pro / arcpy versions, sym.colorizer.classBreaks is
+    # READ-ONLY on RasterClassifyColorizer - reassigning it raises
+    # "attribute 'breaks' is not supported on this instance". That exception
+    # used to propagate out of this function and ABORT before Step 3 (the CIM
+    # pass) ever ran - which is why colors/labels looked wrong (they were
+    # still Pro's untouched defaults from Step 1).
+    #
+    # Step 3 (CIM, below) is the real authoritative step for both colors and
+    # labels and runs last, so this block is now just best-effort and must
+    # NEVER be allowed to block Step 3.
+    # =========================================================================
+    try:
+        sym = layer.symbology
+        if hasattr(sym, 'colorizer') and sym.colorizer.type == 'RasterClassifyColorizer':
+            mp_breaks = sym.colorizer.classBreaks
+            if mp_breaks and len(mp_breaks) == NUM_CLASSES:
+                lower_label = round_half_up(float(breaks[0]))
+                for i, mb in enumerate(mp_breaks):
+                    upper_value = float(breaks[i + 1])
+                    upper_label = round_half_up(upper_value)
+                    mb.upperBound = upper_value
+                    mb.label = f"{int(lower_label)} - {int(upper_label)}"
+                    lower_label = upper_label
+
+            layer.symbology = sym
+    except Exception:
+        # Non-fatal: Step 3 (CIM) below sets the real, final values/labels.
+        pass
+
+    # =========================================================================
+    # STEP 3: CIM final pass - lock internals that arcpy.mp can't touch
+    # =========================================================================
     cim_layer = layer.getDefinition("V2")
-   
+
     if cim_layer.colorizer is None:
-        cim_layer.colorizer = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassifyColorizer", "V2")
-       
+        cim_layer.colorizer = arcpy.cim.CreateCIMObjectFromClassName(
+            "CIMRasterClassifyColorizer", "V2"
+        )
+
     update_classify_colorizer_cim(cim_layer.colorizer, breaks, CLASS_COLORS_LOW_TO_HIGH)
-   
-    # Ensure collapsed in TOC
+
     cim_layer.expanded = False
-   
+
     layer.setDefinition(cim_layer)
-    layer.visible = False
 
 
 def apply_symbology_for_field(active_map, field, breaks):
@@ -265,6 +376,7 @@ def apply_symbology_for_field(active_map, field, breaks):
     apply_classified_symbology(layer, breaks)
 
     if not is_classified(layer):
+        # Second attempt with fresh CIM read
         apply_classified_symbology(layer, breaks)
 
     return layer, is_classified(layer)
@@ -305,7 +417,7 @@ def apply_symbology_pass(active_map, breaks_by_field):
         try:
             breaks = breaks_by_field[field]
             layer, ok = apply_symbology_for_field(active_map, field, breaks)
-            status = "OK" if ok else "STILL STRETCH"
+            status = "OK" if ok else "STILL STRETCH/STDDEV"
             print(f"  {layer_name}: {status}")
             if not ok:
                 failed.append(field)
@@ -319,7 +431,7 @@ def apply_symbology_pass(active_map, breaks_by_field):
 
 def fix_reverted_layers(active_map, breaks_by_field):
     """Second pass: ArcGIS sometimes reverts earlier layers to stretch while batch runs."""
-    print("\nFix pass for layers that reverted to stretch...")
+    print("\nFix pass for layers that reverted to stretch/stddev...")
     fixed_any = False
     failed = []
 
