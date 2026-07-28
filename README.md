@@ -1,93 +1,165 @@
-# Batch IDW Interpolation with Percentile-Based Symbology
+# ArcGIS Pro Batch IDW Interpolation with Percentile Symbology
 
-## Overview
+A Python script for **ArcGIS Pro** that automates **Inverse Distance Weighting (IDW)** interpolation for multiple geochemical elements while applying consistent, publication-quality classified symbology.
 
-This script performs batch **Inverse Distance Weighting (IDW)** interpolation for multiple geochemical elements and applies a consistent **7-class percentile-based classified symbology** in ArcGIS Pro.
-
-The class breaks are:
-
-* Minimum
-* 5th percentile
-* 25th percentile
-* 50th percentile
-* 75th percentile
-* 90th percentile
-* 95th percentile
-* Maximum
-
-using the **ColorBrewer RdYlBu (7 Classes)** color ramp (reversed so higher values appear in red).
-
-The script stores the calculated class breaks in `idw_breaks.json` so they can be reused later without recalculating the interpolations.
+The script performs batch interpolation, calculates percentile-based class breaks, and configures raster symbology so that ArcGIS Pro displays **Manual Interval** classification with the **Red–Yellow–Blue (7 Classes)** color ramp.
 
 ---
 
-# How to Run
+## Features
 
-## First Run (Create IDW rasters)
+* Batch IDW interpolation for multiple fields
+* Automatic percentile-based classification
+* Seven-class color scheme
+* Exact (unrounded) classification values
+* Rounded integer labels for map legends
+* Automatic raster statistics calculation
+* Automatic raster loading into the active map
+* Manual Interval classification preserved in ArcGIS Pro
+* Automatic correction if ArcGIS reverts raster symbology
+* Saves class breaks to JSON for reproducible results
+* Supports running interpolation or applying symbology only
 
-Set:
+---
+
+## Classification Scheme
+
+The script creates **7 classes** using the following breakpoints:
+
+Minimum → 5th → 25th → 50th → 75th → 90th → 95th → Maximum
+
+Important:
+
+* Actual classification values remain exact floating-point numbers.
+* Only the displayed labels are rounded using normal "round half up" rounding.
+* This preserves numerical accuracy while producing clean map legends.
+
+---
+
+## Color Ramp
+
+The script uses the ArcGIS Pro color ramp:
+
+**Red–Yellow–Blue (7 Classes)**
+
+with colors reversed so that
+
+* High values → Red
+* Low values → Blue
+
+---
+
+## Supported Elements
+
+By default the script interpolates:
+
+* As
+* Ba
+* Ca
+* Cr
+* Cu
+* Fe
+* Mn
+* Ni
+* Pb
+* Rb
+* Sr
+* Ti
+* V
+* Zn
+
+Additional fields can easily be added by modifying the `Z_FIELDS` list.
+
+---
+
+## Requirements
+
+* ArcGIS Pro
+* Spatial Analyst Extension
+* Python environment included with ArcGIS Pro
+* NumPy
+* arcpy
+
+---
+
+## Input
+
+Point feature class containing geochemical measurements.
+
+Each selected field should contain numeric concentration values.
+
+---
+
+## Output
+
+For every element the script generates:
+
+* IDW raster (.tif)
+* Classified raster layer
+* Manual Interval symbology
+* Rounded legend labels
+* Stored class breaks in `idw_breaks.json`
+
+---
+
+## Usage
+
+### Run interpolation and symbology
 
 ```python
 RUN_IDW = True
 ```
 
-Then run the script.
-
-This will:
-
-* Perform IDW interpolation for every field listed in `Z_FIELDS`.
-* Save each raster as `IDW_<Field>.tif`.
-* Calculate raster statistics.
-* Compute percentile class breaks.
-* Save the class breaks to `idw_breaks.json`.
-* Apply the classified symbology to all newly created rasters.
-
----
-
-## Second Run (Fix / Reapply Symbology)
-
-After the first run completes successfully, change:
+### Apply symbology only to existing rasters
 
 ```python
 RUN_IDW = False
 ```
 
-and run the script **again**.
+---
 
-This second pass:
+## How It Works
 
-* Does **not** recreate the IDW rasters.
-* Loads the previously saved percentile breaks from `idw_breaks.json`.
-* Reapplies the classified symbology to every raster.
-* Performs an additional verification pass because ArcGIS Pro may occasionally revert some raster layers to **Stretch** symbology during batch processing.
-
-Running the script a second time ensures that all raster layers end with the intended manual classified symbology.
+1. Reads point measurements.
+2. Computes percentile break values.
+3. Runs IDW interpolation.
+4. Calculates raster statistics.
+5. Adds rasters to the active ArcGIS Pro map.
+6. Applies Manual Interval classified symbology.
+7. Locks classification using the ArcGIS CIM.
+8. Performs a second verification pass to correct any reverted layers.
 
 ---
 
-# Output Files
+## Key Technical Details
 
-The script creates:
+The script addresses several ArcGIS Pro symbology behaviors, including:
 
-* `IDW_<Field>.tif` — interpolated raster for each element.
-* `idw_breaks.json` — stored percentile class breaks used for reproducible symbology.
-
----
-
-# Requirements
-
-* ArcGIS Pro
-* Spatial Analyst extension
-* Python environment included with ArcGIS Pro
-* NumPy
-
-Run the script from the ArcGIS Pro Python window, Notebook, or an IDE configured to use the ArcGIS Pro Python environment with the target project open.
+* Difference between `ManualInterval` (arcpy.mp) and `Manual` (CIM)
+* Explicit class label assignment
+* Persistent manual class breaks
+* Automatic recovery if ArcGIS reverts layers to Stretch or Standard Deviation rendering
+* Consistent symbology across multiple rasters
 
 ---
 
-# Notes
+## Example Applications
 
-* The script must be executed from an **open ArcGIS Pro project** (`CURRENT` project).
-* The active map must contain the required input layers referenced by the script.
-* Existing rasters are overwritten when `RUN_IDW = True`.
-* The second execution (`RUN_IDW = False`) is intentional and recommended to ensure ArcGIS Pro retains the manual classified symbology on every raster layer.
+* Geochemical mapping
+* Environmental contamination studies
+* Soil chemistry visualization
+* Mineral exploration
+* Heavy metal distribution mapping
+* Environmental baseline surveys
+
+---
+
+## License
+
+MIT License
+
+---
+
+## Author
+
+Nikolaos Avgoustatos
