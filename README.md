@@ -1,7 +1,3 @@
-Here is a complete and professional `README.md` formatted specifically for your GitHub repository. You can copy and paste this directly into a `README.md` file in your repo.
-
-***
-
 # ArcGIS Pro Batch IDW & Percentile Symbology Automation
 
 This Python script automates Inverse Distance Weighting (IDW) interpolation for multiple geochemical elements and applies highly customized, percentile-based classified symbology. It is designed to run inside an active ArcGIS Pro project and leverages a hybrid `arcpy.mp` and direct CIM (Cartographic Information Model) manipulation approach to bypass standard API limitations and UI quirks.
