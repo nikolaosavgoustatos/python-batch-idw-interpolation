@@ -1,27 +1,29 @@
 """
-Batch IDW interpolation with percentile-based classified symbology.
-Classes: min -> 5th -> 25th -> 50th -> 75th -> 90th -> 95th -> max (7 classes).
-Color ramp: RdYlBu-7 (red at high values). Break values are exact/unrounded;
-only the displayed labels are rounded (normal rounding) to integers.
-Classification method + color ramp are set via arcpy.mp (so the Symbology
-pane UI shows "Manual Interval" and "Red-Yellow-Blue (7 Classes)"), the CIM layer is
-mutated afterward so the actual break values/labels are exact.
+Batch IDW interpolation with log-scaled classified symbology.
 
-KEY FIXES:
-  1. arcpy.mp uses 'ManualInterval', CIM uses 'Manual' - these are different!
-  2. Labels must be set via arcpy.mp BEFORE final layer.symbology assignment,
-     otherwise Pro regenerates them from float values (showing decimals).
-  3. numberFormat removed to prevent interference with explicit labels.
-  4. sym.colorizer.classBreaks returns a COPY of the break list - mutating
-     items in that copy does nothing until it's reassigned back onto the
-     colorizer. This was why labels weren't actually rounding up before.
+Classification:
+    N_CLASSES breaks evenly spaced in log10 space, upperBounds back-transformed
+    (10**x) so the raster classification follows the log distribution while the
+    legend labels stay in true ppm.
+Color Ramp:
+    "Prediction" (pulled from ArcGIS Colors style by name). Colors are sampled
+    directly from the ramp via readColors() — NOT read back from the layer's
+    symbology (which was returning black on re-runs).
+Labels:
+    Contiguous, non-overlapping ranges rounded UP to 1 decimal place.
+    Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0" (always keeping 1 
+    decimal place, so 4 becomes 4.0, 4.55 becomes 4.6).
+Legend:
+    Descending order (highest concentrations at top).
+Layer Blend:
+    Multiply (applied via CIM to guarantee it sticks).
 
 Set RUN_IDW = False to re-apply symbology only on existing layers/rasters.
+Set EXPORT_LOG_MAPS = True to also export per-element TIFFs.
 Run inside ArcGIS Pro (CURRENT project must be open).
 """
 
 import arcpy
-import json
 import math
 import os
 import traceback
@@ -41,174 +43,232 @@ OUT_CELL_SIZE = 50
 POWER = 2
 SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
 IN_BARRIER = ""
-PERCENTILES = [5, 25, 50, 75, 90, 95]
+
 NUM_CLASSES = 7
-COLOR_RAMP_NAME = "Red-Yellow-Blue (7 Classes)"
+COLOR_RAMP_NAME = "Prediction"       # exact name in ArcGIS Colors style
+LOG_MIN_FLOOR = 1e-6                 # avoid log10(0) for near-zero minimums
+
+# Fallback ramp (blue -> red) used ONLY if the named ramp truly can't be
+# sampled for a given break. Distinct colors beat identical flat-red classes.
+FALLBACK_RAMP = [(49, 54, 149), (116, 173, 209), (255, 255, 191),
+                  (253, 174, 97), (215, 48, 39)]
 
 # True = run IDW + symbology. False = fix symbology on existing rasters/layers only.
 RUN_IDW = False
 
-# ColorBrewer RdYlBu 7-class, reversed so high values render red
-RDYLBU_7_HEX = ["#d73027", "#fc8d59", "#fee090", "#ffffbf", "#e0f3f8", "#91bfdb", "#4575b4"]
-CLASS_COLORS_LOW_TO_HIGH = list(reversed(RDYLBU_7_HEX))
+# True = export one TIFF per element with the log-scaled symbology.
+EXPORT_LOG_MAPS = False
+EXPORT_DPI = 300
+EXPORT_WIDTH = 2400
+EXPORT_HEIGHT = 2400
+EXPORT_SUBFOLDER = "log_maps"
+
+# Cache the color ramp object once - avoid re-fetching it from project styles
+# on every field (also avoids the repeated listColorRamps() cost).
+_PREDICTION_RAMP_CACHE = None
 
 
-def round_half_up(value):
-    """Normal rounding (32.1 -> 32, 32.5 -> 33, 32.9 -> 33).
-
-    Python's built-in round() uses banker's rounding (round-half-to-even),
-    which would turn 32.5 into 32, not 33. This uses floor(x + 0.5) instead,
-    which matches everyday "round half up" rounding for these values.
+# ---------------------------------------------------------------------------
+# Rounding / formatting helpers
+# ---------------------------------------------------------------------------
+def ceil_to_decimal(value, decimals=1):
+    """Round UP (toward +inf) to a fixed number of decimal places.
+    
+    Includes a tolerance so that a value like 4.0001 absorbs the floating 
+    point noise and correctly becomes 4.0 instead of jumping to 4.1.
     """
-    return math.floor(value + 0.5)
+    factor = 10 ** decimals
+    scaled = value * factor
+    
+    # If scaled is within 1e-3 above an integer, treat it as that integer
+    # to absorb floating point dust (e.g. 4.0001 -> 40.001 -> 40.0)
+    if scaled - math.floor(scaled) <= 1e-3:
+        return math.floor(scaled) / factor
+    
+    return math.ceil(scaled) / factor
 
 
-def hex_to_rgb(hex_color):
-    value = hex_color.lstrip("#")
-    return [int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16), 100]
+def format_decimal(value):
+    """Format with EXACTLY 1 decimal place (e.g. 4 -> 4.0, 4.55 -> 4.6)."""
+    # Using Python's standard formatting safely rounds and keeps the .0
+    return f"{value:.1f}"
 
 
-def make_cim_color(hex_color):
-    r, g, b, a = hex_to_rgb(hex_color)
-    color = arcpy.cim.CreateCIMObjectFromClassName("CIMRGBColor", "V2")
-    color.values = [r, g, b, a]
-    color.colorSpace = arcpy.cim.CreateCIMObjectFromClassName("CIMICCColorSpace", "V2")
-    color.colorSpace.url = "Default RGB profile"
-    return color
+def build_class_labels(breaks):
+    """Build contiguous, non-overlapping labels with 1 decimal ceil rounding.
+    Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0".
+    """
+    labels = []
+    for i in range(len(breaks) - 1):
+        if i == 0:
+            lower = ceil_to_decimal(float(breaks[0]))
+        else:
+            # Calculate previous upper bound, add 0.1 for the next lower bound
+            prev_upper = ceil_to_decimal(float(breaks[i]))
+            lower = prev_upper + 0.1
+        upper = ceil_to_decimal(float(breaks[i + 1]))
+        labels.append(f"{format_decimal(lower)} - {format_decimal(upper)}")
+    return labels
 
 
+# ---------------------------------------------------------------------------
+# Color helpers
+# ---------------------------------------------------------------------------
+def rgb_to_cim_color(r, g, b, a=100):
+    cim_color = arcpy.cim.CreateCIMObjectFromClassName("CIMRGBColor", "V2")
+    cim_color.values = [int(r), int(g), int(b), int(a)]
+    cim_color.colorSpace = arcpy.cim.CreateCIMObjectFromClassName("CIMICCColorSpace", "V2")
+    cim_color.colorSpace.url = "Default RGB profile"
+    return cim_color
+
+
+def arcpy_color_to_cim(arcpy_color):
+    """Convert an arcpy.mp.Color (or similar RGB-bearing object) to CIMRGBColor."""
+    if hasattr(arcpy_color, "RGB"):
+        r, g, b = arcpy_color.RGB[:3]
+    else:
+        r = int(getattr(arcpy_color, "red", 0))
+        g = int(getattr(arcpy_color, "green", 0))
+        b = int(getattr(arcpy_color, "blue", 0))
+    a = int(getattr(arcpy_color, "alpha", 100))
+    return rgb_to_cim_color(r, g, b, a)
+
+
+def fallback_color_for_index(i, n):
+    """Deterministic, visually distinct fallback color - never flat red for
+    every class. Linearly interpolates across FALLBACK_RAMP."""
+    if n <= 1:
+        t = 0.0
+    else:
+        t = i / (n - 1)
+    stops = FALLBACK_RAMP
+    scaled = t * (len(stops) - 1)
+    lo = int(math.floor(scaled))
+    hi = min(lo + 1, len(stops) - 1)
+    frac = scaled - lo
+    r = stops[lo][0] + (stops[hi][0] - stops[lo][0]) * frac
+    g = stops[lo][1] + (stops[hi][1] - stops[lo][1]) * frac
+    b = stops[lo][2] + (stops[hi][2] - stops[lo][2]) * frac
+    return rgb_to_cim_color(r, g, b, 100)
+
+
+def get_prediction_ramp(force_refresh=False):
+    """Pull the 'Prediction' color ramp from project styles (cached)."""
+    global _PREDICTION_RAMP_CACHE
+    if _PREDICTION_RAMP_CACHE is not None and not force_refresh:
+        return _PREDICTION_RAMP_CACHE
+
+    aprx = arcpy.mp.ArcGISProject("CURRENT")
+    ramps = aprx.listColorRamps(COLOR_RAMP_NAME)
+    if not ramps:
+        ramps = aprx.listColorRamps(f"*{COLOR_RAMP_NAME}*")
+    if not ramps:
+        raise RuntimeError(
+            f"Color ramp '{COLOR_RAMP_NAME}' was not found in project styles. "
+            "Open the Symbology pane / Style manager and verify the ramp name."
+        )
+    _PREDICTION_RAMP_CACHE = ramps[0]
+    return _PREDICTION_RAMP_CACHE
+
+
+def sample_ramp_colors(ramp, num_classes):
+    """Sample N colors directly from a ColorRamp using readColors().
+
+    This is the reliable way to get colors from the named ramp. The previous
+    approach of reading colors back from the layer's arcpy.mp symbology was
+    unreliable on re-runs (returned black/empty colors).
+    """
+    try:
+        colors = ramp.readColors(num_classes)
+        if colors and len(colors) >= num_classes:
+            return [arcpy_color_to_cim(c) for c in colors[:num_classes]]
+    except Exception as exc:
+        print(f"    NOTE: ramp.readColors() failed: {exc}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
 def raster_path_for_field(field):
     return os.path.join(OUT_FOLDER, f"IDW_{field}.tif")
 
 
-def breaks_json_path():
-    return os.path.join(OUT_FOLDER, "idw_breaks.json")
+# ---------------------------------------------------------------------------
+# Log breaks from raster min/max
+# ---------------------------------------------------------------------------
+def get_raster_min_max(raster_path):
+    """Return (min, max) of a raster, forcing statistics first."""
+    try:
+        arcpy.management.CalculateStatistics(raster_path)
+    except Exception as exc:
+        print(f"    WARNING: CalculateStatistics failed for {raster_path}: {exc}")
+    raster = arcpy.Raster(raster_path)
+    rmin, rmax = raster.minimum, raster.maximum
+    if rmin is None or rmax is None:
+        raise RuntimeError(
+            f"Raster {raster_path} has no min/max statistics "
+            "(CalculateStatistics may have failed, or raster is all-NoData)."
+        )
+    return float(rmin), float(rmax)
 
 
-def get_percentile_breaks_from_points(points_fc, field, pct_list):
-    """Build 8 break points (7 classes) from sample points.
+def build_log_breaks_and_labels(raw_min, raw_max, num_classes, floor_min=LOG_MIN_FLOOR):
+    """Build N+1 break points evenly spaced in log10 space, plus N labels."""
+    if raw_min <= 0:
+        raw_min = floor_min
+    if raw_max <= raw_min:
+        raw_max = raw_min * 10.0
 
-    All values (min, percentiles, max) are kept exact/unrounded floats.
-    Rounding is applied ONLY at label-display time, not here.
-    """
-    vals = []
-    with arcpy.da.SearchCursor(points_fc, [field]) as cursor:
-        for row in cursor:
-            if row[0] is not None:
-                vals.append(row[0])
+    log_min = math.log10(raw_min)
+    log_max = math.log10(raw_max)
+    log_breaks = np.linspace(log_min, log_max, num_classes + 1)
+    breaks = [float(10 ** x) for x in log_breaks]
 
-    if not vals:
-        raise ValueError(f"No valid values found for field '{field}' in {points_fc}.")
+    labels = build_class_labels(breaks)
 
-    arr = np.array(vals, dtype=float)
-
-    # 1. Minimum: exact value, no rounding
-    breaks = [float(np.min(arr))]
-
-    # 2. Percentiles: exact values, no rounding
-    for p in pct_list:
-        v = float(np.percentile(arr, p))
-        breaks.append(v)
-
-    # 3. Maximum: exact value, no rounding
-    breaks.append(float(np.max(arr)))
-
-    # Ensure classes are strictly increasing
-    for i in range(1, len(breaks)):
-        if breaks[i] <= breaks[i - 1]:
-            breaks[i] = breaks[i - 1] + 1e-6
-
-    return breaks
+    return breaks, labels
 
 
-def load_or_compute_breaks(field):
-    breaks_file = breaks_json_path()
-    if os.path.exists(breaks_file):
-        with open(breaks_file, "r", encoding="utf-8") as handle:
-            all_breaks = json.load(handle)
-        if field in all_breaks:
-            return all_breaks[field]
+# ---------------------------------------------------------------------------
+# Symbology Application
+# ---------------------------------------------------------------------------
+def update_colorizer_cim(colorizer, breaks, labels, cim_colors):
+    """Configure a CIMRasterClassifyColorizer for log-spaced breaks.
 
-    return get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
-
-
-def save_breaks(all_breaks):
-    with open(breaks_json_path(), "w", encoding="utf-8") as handle:
-        json.dump(all_breaks, handle, indent=2)
-
-
-def update_classify_colorizer_cim(colorizer, breaks, hex_colors):
-    """Mutate an existing CIMRasterClassifyColorizer to lock in the manual
-    (custom interval) breaks without breaking the UI dropdowns in ArcGIS Pro.
-
-    Break VALUES (used for classification) are kept exact/unrounded, exactly
-    as computed in get_percentile_breaks_from_points.
-
-    Break LABELS (display text only) always show the normally-rounded
-    integer, for every class boundary including the first (min) and the max.
-
-    NOTE: CIM uses 'Manual' for classificationMethod (not 'ManualInterval')
+    This function is designed to work on a FRESH colorizer object (created
+    via CreateCIMObjectFromClassName), NOT on a pre-existing one. This avoids
+    stale properties (numberFormat, deviationInterval, etc.) from previous
+    runs that were overriding our custom labels and colors.
     """
     upper_values = breaks[1:]
-    if len(upper_values) != len(hex_colors):
-        raise RuntimeError(
-            f"Break count ({len(upper_values)}) does not match color count ({len(hex_colors)})."
-        )
+    n = len(upper_values)
 
     class_breaks = []
-    lower_value = float(breaks[0])
-    lower_label = round_half_up(lower_value)
+    for i in range(n):
+        cb = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassBreak", "V2")
+        cb.upperBound = float(upper_values[i])
+        cb.label = labels[i]
+        cb.color = cim_colors[i]
+        class_breaks.append(cb)
 
-    for i, upper in enumerate(upper_values):
-        class_break = arcpy.cim.CreateCIMObjectFromClassName(
-            "CIMRasterClassBreak", "V2"
-        )
-
-        upper_value = float(upper)
-        upper_label = round_half_up(upper_value)
-
-        # Actual classification value: exact/unrounded.
-        class_break.upperBound = upper_value
-
-        # Display label: always normally-rounded integers.
-        class_break.label = f"{int(lower_label)} - {int(upper_label)}"
-
-        class_break.color = make_cim_color(hex_colors[i])
-        class_breaks.append(class_break)
-
-        lower_value = upper_value
-        lower_label = upper_label
-
-    # CRITICAL: Set classBreakType to "ClassBreaks" (not "StandardDeviation")
     colorizer.classBreakType = "ClassBreaks"
-
-    # CRITICAL: CIM uses "Manual" (arcpy.mp uses "ManualInterval" - they're different!)
+    # CIM uses "Manual" (arcpy.mp uses "ManualInterval" - they're different!)
     colorizer.classificationMethod = "Manual"
-
-    colorizer.field = "VALUE"
+    colorizer.field = "Value"
     colorizer.resamplingType = "BilinearInterpolation"
-
     colorizer.minimumBreak = float(breaks[0])
-    colorizer.showInAscendingOrder = True
+
+    # REVERSED ORDER IN LEGEND: highest values appear at the top
+    colorizer.showInAscendingOrder = False
+
     colorizer.classBreaks = class_breaks
     colorizer.numberOfBreaks = len(class_breaks)
 
-    # Clear deviationInterval if it exists (only relevant for StandardDeviation)
-    if hasattr(colorizer, 'deviationInterval'):
-        try:
-            colorizer.deviationInterval = None
-        except Exception:
-            pass
-
-    # REMOVED numberFormat - it was interfering with explicit label strings.
-    # Since every class_break.label is set explicitly above, we do NOT need
-    # a colorizer-level numberFormat.  Leaving it out lets Pro use the raw
-    # label string we provided (e.g. "5 - 10") without re-formatting.
-    if hasattr(colorizer, 'numberFormat'):
-        try:
-            colorizer.numberFormat = None
-        except Exception:
-            pass
+    # NOTE: Do NOT set numberFormat or deviationInterval to None here.
+    # On a fresh colorizer they don't exist yet, and setting them to None
+    # on a pre-existing colorizer was causing Pro to auto-regenerate labels
+    # from the upper bounds, discarding our custom labels.
 
 
 def get_class_break_count(colorizer):
@@ -222,15 +282,12 @@ def get_class_break_count(colorizer):
 
 
 def is_classified(layer):
-    """Check if layer has proper Manual classification (not Standard Deviation)."""
+    """Check if layer has proper classification."""
     cim = layer.getDefinition("V2")
     colorizer = cim.colorizer
     if colorizer is None:
         return False
     if type(colorizer).__name__ != "CIMRasterClassifyColorizer":
-        return False
-    # CIM uses "Manual" for classificationMethod
-    if getattr(colorizer, "classificationMethod", None) != "Manual":
         return False
     if getattr(colorizer, "classBreakType", None) != "ClassBreaks":
         return False
@@ -261,131 +318,175 @@ def ensure_layer_on_map(active_map, field, raster_path):
     return layer
 
 
-def apply_classified_symbology(layer, breaks):
-    """Apply classify symbology with correct "Manual Interval" showing in UI
-    and normally-rounded integer labels.
+def apply_symbology(layer, raster_path, num_classes=NUM_CLASSES, floor_min=LOG_MIN_FLOOR):
+    """Apply log-scaled classified symbology to a raster layer."""
+    raw_min, raw_max = get_raster_min_max(raster_path)
+    breaks, labels = build_log_breaks_and_labels(
+        raw_min, raw_max, num_classes, floor_min
+    )
 
-    KEY INSIGHT: arcpy.mp and CIM use DIFFERENT values for the same concept:
-    - arcpy.mp uses 'ManualInterval'
-    - CIM uses 'Manual'
+    ramp = get_prediction_ramp()
 
-    KEY INSIGHT #2: When you assign layer.symbology = sym, Pro REGENERATES
-    labels from the float break values unless you explicitly set each break's
-    .label property via arcpy.mp BEFORE the final assignment.
-
-    KEY INSIGHT #3: sym.colorizer.classBreaks returns a COPY of the break
-    list, not a live reference. Mutating .label / .upperBound on items in
-    that copy does nothing on its own - the copy must be explicitly
-    reassigned back onto sym.colorizer.classBreaks before the next
-    layer.symbology = sym, or the edits are silently lost.
-
-    Step 1: Set arcpy.mp with 'ManualInterval' + colorRamp + breakCount
-    Step 2: Re-read sym, override each break's upperBound AND label with
-            exact values / normally-rounded integer strings, then write the edited
-            list back onto sym.colorizer.classBreaks
-    Step 3: Final layer.symbology = sym (labels now survive because they
-            were written back onto the colorizer before this assignment)
-    Step 4: CIM pass to lock in classBreakType and other internals
-    """
-
-    aprx = arcpy.mp.ArcGISProject("CURRENT")
-
-    # =========================================================================
-    # STEP 1: Initialize colorizer with method + ramp + break count
-    # =========================================================================
+    # Step 1: Ensure the layer has a RasterClassifyColorizer with the ramp set.
+    # This is a minimal setup — the CIM pass (Step 3) does the heavy lifting.
     sym = layer.symbology
-    if hasattr(sym, 'colorizer'):
-        if sym.colorizer.type != 'RasterClassifyColorizer':
-            sym.updateColorizer('RasterClassifyColorizer')
-
-        sym.colorizer.breakCount = NUM_CLASSES
-
-        # Set colorRamp BEFORE classificationMethod
-        ramps = aprx.listColorRamps(COLOR_RAMP_NAME)
-        if ramps:
-            sym.colorizer.colorRamp = ramps[0]
-
-        # CRITICAL: arcpy.mp uses 'ManualInterval', CIM uses 'Manual'
-        sym.colorizer.classificationMethod = 'ManualInterval'
-
-        # First assignment: generates the 7 class break slots
-        layer.symbology = sym
-
-    # =========================================================================
-    # STEP 2: Best-effort override of break VALUES/LABELS via arcpy.mp.
-    #
-    # NOTE: On some ArcGIS Pro / arcpy versions, sym.colorizer.classBreaks is
-    # READ-ONLY on RasterClassifyColorizer - reassigning it raises
-    # "attribute 'breaks' is not supported on this instance". That exception
-    # used to propagate out of this function and ABORT before Step 3 (the CIM
-    # pass) ever ran - which is why colors/labels looked wrong (they were
-    # still Pro's untouched defaults from Step 1).
-    #
-    # Step 3 (CIM, below) is the real authoritative step for both colors and
-    # labels and runs last, so this block is now just best-effort and must
-    # NEVER be allowed to block Step 3.
-    # =========================================================================
-    try:
-        sym = layer.symbology
-        if hasattr(sym, 'colorizer') and sym.colorizer.type == 'RasterClassifyColorizer':
-            mp_breaks = sym.colorizer.classBreaks
-            if mp_breaks and len(mp_breaks) == NUM_CLASSES:
-                lower_label = round_half_up(float(breaks[0]))
-                for i, mb in enumerate(mp_breaks):
-                    upper_value = float(breaks[i + 1])
-                    upper_label = round_half_up(upper_value)
-                    mb.upperBound = upper_value
-                    mb.label = f"{int(lower_label)} - {int(upper_label)}"
-                    lower_label = upper_label
-
+    if hasattr(sym, "colorizer"):
+        if sym.colorizer.type != "RasterClassifyColorizer":
+            sym.updateColorizer("RasterClassifyColorizer")
+            # CRITICAL: updateColorizer() only mutates this local, uncommitted
+            # `sym` object — must commit before re-fetching.
             layer.symbology = sym
-    except Exception:
-        # Non-fatal: Step 3 (CIM) below sets the real, final values/labels.
-        pass
+            sym = layer.symbology
+        try:
+            sym.colorizer.field = "Value"
+            sym.colorizer.classificationMethod = "ManualInterval"
+            sym.colorizer.colorRamp = ramp
+            sym.colorizer.breakCount = num_classes
+            layer.symbology = sym
+        except Exception as exc:
+            print(f"    NOTE: mp setup partial failure: {exc}")
 
-    # =========================================================================
-    # STEP 3: CIM final pass - lock internals that arcpy.mp can't touch
-    # =========================================================================
+    # Step 2: Sample colors DIRECTLY from the Prediction ramp.
+    # This is the key fix — readColors() is reliable on every run, unlike
+    # reading colors back from the layer's symbology which returned black
+    # on re-runs.
+    cim_colors = sample_ramp_colors(ramp, num_classes)
+    if cim_colors is None:
+        print(f"    Using deterministic fallback ramp for {os.path.basename(raster_path)}.")
+        cim_colors = [fallback_color_for_index(i, num_classes) for i in range(num_classes)]
+
+    # Step 3: CIM pass — create a FRESH colorizer to avoid stale properties.
+    # The previous approach mutated the existing colorizer, which retained
+    # a stale numberFormat from the previous run that caused Pro to discard
+    # our custom range labels and show bare numbers instead.
     cim_layer = layer.getDefinition("V2")
-
-    if cim_layer.colorizer is None:
-        cim_layer.colorizer = arcpy.cim.CreateCIMObjectFromClassName(
-            "CIMRasterClassifyColorizer", "V2"
-        )
-
-    update_classify_colorizer_cim(cim_layer.colorizer, breaks, CLASS_COLORS_LOW_TO_HIGH)
-
+    new_colorizer = arcpy.cim.CreateCIMObjectFromClassName(
+        "CIMRasterClassifyColorizer", "V2"
+    )
+    update_colorizer_cim(new_colorizer, breaks, labels, cim_colors)
+    cim_layer.colorizer = new_colorizer
     cim_layer.expanded = False
+
+    # Layer Blend Mode — DO NOT CHANGE. This is working correctly.
+    cim_layer.blendingMode = "Multiply"
 
     layer.setDefinition(cim_layer)
 
+    return breaks, labels
 
-def apply_symbology_for_field(active_map, field, breaks):
+
+def apply_symbology_for_field(active_map, field):
     raster_path = raster_path_for_field(field)
     layer_name = f"IDW_{field}"
 
     if not os.path.exists(raster_path):
         raise FileNotFoundError(f"Missing raster: {raster_path}")
 
-    try:
-        arcpy.management.CalculateStatistics(raster_path)
-    except Exception:
-        pass
-
     layer = ensure_layer_on_map(active_map, field, raster_path)
-    apply_classified_symbology(layer, breaks)
 
-    if not is_classified(layer):
-        # Second attempt with fresh CIM read
-        apply_classified_symbology(layer, breaks)
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            apply_symbology(layer, raster_path)
+        except Exception as exc:
+            last_exc = exc
+            print(f"    {layer_name}: attempt {attempt} raised: {exc}")
+            traceback.print_exc()
+            continue
 
-    return layer, is_classified(layer)
+        if is_classified(layer):
+            return layer, True
+        print(f"    {layer_name}: attempt {attempt} did not result in a valid "
+              f"classification (is_classified() == False).")
+
+    if last_exc is not None:
+        print(f"    {layer_name}: last error was: {last_exc}")
+
+    return layer, False
 
 
+# ---------------------------------------------------------------------------
+# Map Export
+# ---------------------------------------------------------------------------
+def export_element_maps(active_map, output_folder):
+    """For each element field: make the layer visible, export the map view
+    to TIFF, then hide the layer again.
+    """
+    print("\n=== Exporting element maps with log-scaled symbology ===")
+
+    # Hide all element layers first
+    for field in Z_FIELDS:
+        layer = find_map_layer(active_map, f"IDW_{field}")
+        if layer:
+            layer.visible = False
+
+    export_subfolder = os.path.join(output_folder, EXPORT_SUBFOLDER)
+    os.makedirs(export_subfolder, exist_ok=True)
+
+    aprx = arcpy.mp.ArcGISProject("CURRENT")
+    active_view = aprx.activeView
+
+    failed = []
+    for field in Z_FIELDS:
+        layer_name = f"IDW_{field}"
+        raster_path = raster_path_for_field(field)
+        if not os.path.exists(raster_path):
+            print(f"  {layer_name}: raster missing - skipping")
+            failed.append(field)
+            continue
+
+        layer = find_map_layer(active_map, layer_name)
+        if not layer:
+            try:
+                layer = ensure_layer_on_map(active_map, field, raster_path)
+            except Exception as exc:
+                print(f"  {layer_name}: couldn't add layer - {exc}")
+                failed.append(field)
+                continue
+
+        try:
+            layer.visible = True
+
+            # Ensure symbology is locked (in case map reverted it)
+            apply_symbology(layer, raster_path)
+
+            if active_view:
+                try:
+                    active_view.refresh()
+                except Exception:
+                    pass
+
+            out_tiff = os.path.join(export_subfolder, f"{layer_name}_log.tif")
+            if active_view and active_view.type == "MAP_VIEW":
+                active_view.exportToTIFF(
+                    out_tiff,
+                    resolution=EXPORT_DPI,
+                    width=EXPORT_WIDTH,
+                    height=EXPORT_HEIGHT,
+                )
+                print(f"  Exported: {os.path.basename(out_tiff)}")
+            else:
+                print(f"  {layer_name}: no active MAP_VIEW - skipping export")
+                failed.append(field)
+
+            layer.visible = False
+        except Exception as exc:
+            print(f"  {layer_name}: ERROR - {exc}")
+            traceback.print_exc()
+            failed.append(field)
+            try:
+                layer.visible = False
+            except Exception:
+                pass
+
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# IDW
+# ---------------------------------------------------------------------------
 def run_idw_for_field(field):
     print(f"Running IDW for {field}...")
-    breaks = get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
-    print(f"  Breaks: {breaks}")
 
     out_idw = arcpy.sa.Idw(
         in_point_features=IN_POINTS,
@@ -405,66 +506,10 @@ def run_idw_for_field(field):
     except Exception as exc:
         print(f"  WARNING: CalculateStatistics failed: {exc}")
 
-    return breaks
 
-
-def apply_symbology_pass(active_map, breaks_by_field):
-    print("\nApplying classified symbology to all layers...")
-    failed = []
-
-    for field in Z_FIELDS:
-        layer_name = f"IDW_{field}"
-        try:
-            breaks = breaks_by_field[field]
-            layer, ok = apply_symbology_for_field(active_map, field, breaks)
-            status = "OK" if ok else "STILL STRETCH/STDDEV"
-            print(f"  {layer_name}: {status}")
-            if not ok:
-                failed.append(field)
-        except Exception as exc:
-            print(f"  {layer_name}: ERROR - {exc}")
-            traceback.print_exc()
-            failed.append(field)
-
-    return failed
-
-
-def fix_reverted_layers(active_map, breaks_by_field):
-    """Second pass: ArcGIS sometimes reverts earlier layers to stretch while batch runs."""
-    print("\nFix pass for layers that reverted to stretch/stddev...")
-    fixed_any = False
-    failed = []
-
-    aprx = arcpy.mp.ArcGISProject("CURRENT")
-    if aprx.activeView:
-        try:
-            aprx.activeView.refresh()
-        except AttributeError:
-            pass
-
-    for field in Z_FIELDS:
-        layer_name = f"IDW_{field}"
-        layer = find_map_layer(active_map, layer_name)
-        if not layer:
-            continue
-        if is_classified(layer):
-            continue
-
-        fixed_any = True
-        print(f"  Re-applying classify to {layer_name}...")
-        try:
-            _, ok = apply_symbology_for_field(active_map, field, breaks_by_field[field])
-            if not ok:
-                failed.append(field)
-        except Exception as exc:
-            print(f"  {layer_name}: ERROR - {exc}")
-            failed.append(field)
-
-    if not fixed_any:
-        print("  All layers already classified.")
-    return failed
-
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     os.makedirs(OUT_FOLDER, exist_ok=True)
 
@@ -472,6 +517,13 @@ def main():
     active_map = aprx.activeMap
     if not active_map:
         raise RuntimeError("No active map found in the CURRENT project.")
+
+    # Fail fast (with a clear message) if the ramp genuinely doesn't exist
+    try:
+        get_prediction_ramp()
+    except RuntimeError as exc:
+        print(f"FATAL: {exc}")
+        return
 
     env_kwargs = {
         "overwriteOutput": True,
@@ -490,26 +542,42 @@ def main():
     failed_fields = []
 
     try:
-        breaks_by_field = {}
-
         with arcpy.EnvManager(**env_kwargs):
             if RUN_IDW:
                 print("Phase 1: IDW interpolation...")
                 for field in Z_FIELDS:
                     try:
-                        breaks_by_field[field] = run_idw_for_field(field)
+                        run_idw_for_field(field)
                     except Exception as exc:
                         print(f"  ERROR in IDW for {field}: {exc}")
                         traceback.print_exc()
                         failed_fields.append(field)
-                save_breaks(breaks_by_field)
             else:
                 print("Phase 1 skipped (RUN_IDW = False).")
-                for field in Z_FIELDS:
-                    breaks_by_field[field] = load_or_compute_breaks(field)
 
-            failed_symbology = apply_symbology_pass(active_map, breaks_by_field)
-            failed_fix = fix_reverted_layers(active_map, breaks_by_field)
+            # Phase 2: Log-scaled symbology on map layers
+            print("\nPhase 2: Applying log-scaled (Prediction) symbology to all layers...")
+            for field in Z_FIELDS:
+                layer_name = f"IDW_{field}"
+                try:
+                    layer, ok = apply_symbology_for_field(active_map, field)
+                    status = "OK" if ok else "FAILED"
+                    print(f"  {layer_name}: {status}")
+                    if not ok:
+                        failed_fields.append(field)
+                except Exception as exc:
+                    print(f"  {layer_name}: ERROR - {exc}")
+                    traceback.print_exc()
+                    failed_fields.append(field)
+
+            # Phase 3 (optional): per-element TIFF exports
+            if EXPORT_LOG_MAPS:
+                try:
+                    failed_export = export_element_maps(active_map, OUT_FOLDER)
+                    failed_fields.extend(failed_export)
+                except Exception as exc:
+                    print(f"  ERROR during map export: {exc}")
+                    traceback.print_exc()
 
             if aprx.activeView:
                 try:
@@ -521,11 +589,11 @@ def main():
             except Exception:
                 pass
 
-        failed_fields = sorted(set(failed_fields + failed_symbology + failed_fix))
+        failed_fields = sorted(set(failed_fields))
         if failed_fields:
             print(f"\nFields needing attention: {failed_fields}")
         else:
-            print("\nAll fields classified successfully.")
+            print("\nAll fields processed successfully.")
         print("Done.")
     finally:
         arcpy.CheckInExtension("Spatial")
