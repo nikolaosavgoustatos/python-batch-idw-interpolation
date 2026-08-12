@@ -5,8 +5,13 @@ This Python script automates Inverse Distance Weighting (IDW) interpolation for 
 ## Key Features
 
 - **Batch IDW Interpolation**: Processes multiple trace elements (As, Ba, Ca, Cr, Cu, Fe, Mn, Ni, Pb, Rb, Sr, Ti, V, Zn) from a single input point feature class.
-- **Percentile-Based Classification**: Generates 7 classes strictly based on sample point distribution: `min` → `5th` → `25th` (1st Quartile) → `50th` (Median) → `75th` (3rd Quartile) → `90th` → `95th` → `max`.
-- **Custom Contiguous Labels**: Generates non-overlapping range labels rounded *UP* to 1 decimal place (e.g., `"4.0 - 5.1"`, `"5.2 - 6.8"`). Includes floating-point noise absorption so values like `4.0001` correctly become `4.0` instead of jumping to `4.1`.
+- **Exact Percentile-Based Classification**: Generates 7 classes strictly based on sample point distribution: `min` → `5th` → `25th` (1st Quartile) → `50th` (Median) → `75th` (3rd Quartile) → `90th` → `95th` → `max`. 
+  - **Break Values**: Kept as exact, unrounded floats so the map classification mathematically matches the true data distribution.
+  - **Interval Logic**: Uses the mathematical interval `(x, y]` (greater than lower bound, less than or equal to upper bound).
+- **Custom Contiguous Labels**: Generates non-overlapping range labels rounded *UP* to 1 decimal place. 
+  - First lower bound: `ceil_to_decimal(min)`
+  - Subsequent lower bounds: `ceil_to_decimal(prev_upper) + 0.1`
+  - Formatted strictly with 1 decimal place (e.g., `"4.0 - 5.1"`, `"5.2 - 6.8"`). Includes floating-point noise absorption so values like `4.0001` correctly become `4.0` instead of jumping to `4.1`.
 - **Color Ramp Preservation**: Applies the "Prediction" color ramp from the ArcGIS Colors style. Uses `arcpy.mp` to let Pro generate the colors internally, then safely modifies the bounds and labels via CIM without losing the generated colors.
 - **Layer Blend Mode**: Locks the layer blend mode to **Multiply** directly in the CIM definition so it persists reliably.
 - **Descending Legend**: Sets the legend order so the highest concentrations appear at the top.
