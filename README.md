@@ -1,165 +1,65 @@
-# ArcGIS Pro Batch IDW Interpolation with Percentile Symbology
+# ArcGIS Pro Batch IDW & Log-Scaled Symbology
 
-A Python script for **ArcGIS Pro** that automates **Inverse Distance Weighting (IDW)** interpolation for multiple geochemical elements while applying consistent, publication-quality classified symbology.
+This Python script automates Inverse Distance Weighting (IDW) interpolation for multiple geochemical elements and applies highly customized, log-scaled classified symbology. It is designed to run inside an active ArcGIS Pro project and leverages both the `arcpy.mp` API and direct CIM (Cartographic Information Model) manipulation to bypass standard UI limitations.
 
-The script performs batch interpolation, calculates percentile-based class breaks, and configures raster symbology so that ArcGIS Pro displays **Manual Interval** classification with the **Red–Yellow–Blue (7 Classes)** color ramp.
+## Key Features
 
----
-
-## Features
-
-* Batch IDW interpolation for multiple fields
-* Automatic percentile-based classification
-* Seven-class color scheme
-* Exact (unrounded) classification values
-* Rounded integer labels for map legends
-* Automatic raster statistics calculation
-* Automatic raster loading into the active map
-* Manual Interval classification preserved in ArcGIS Pro
-* Automatic correction if ArcGIS reverts raster symbology
-* Saves class breaks to JSON for reproducible results
-* Supports running interpolation or applying symbology only
-
----
-
-## Classification Scheme
-
-The script creates **7 classes** using the following breakpoints:
-
-Minimum → 5th → 25th → 50th → 75th → 90th → 95th → Maximum
-
-Important:
-
-* Actual classification values remain exact floating-point numbers.
-* Only the displayed labels are rounded using normal "round half up" rounding.
-* This preserves numerical accuracy while producing clean map legends.
-
----
-
-## Color Ramp
-
-The script uses the ArcGIS Pro color ramp:
-
-**Red–Yellow–Blue (7 Classes)**
-
-with colors reversed so that
-
-* High values → Red
-* Low values → Blue
-
----
-
-## Supported Elements
-
-By default the script interpolates:
-
-* As
-* Ba
-* Ca
-* Cr
-* Cu
-* Fe
-* Mn
-* Ni
-* Pb
-* Rb
-* Sr
-* Ti
-* V
-* Zn
-
-Additional fields can easily be added by modifying the `Z_FIELDS` list.
-
----
+- **Batch IDW Interpolation**: Processes multiple trace elements (As, Ba, Ca, Cr, Cu, Fe, Mn, Ni, Pb, Rb, Sr, Ti, V, Zn) from a single input point feature class.
+- **Log-Scaled Classification**: Generates classification breaks evenly spaced in `log10` space, then back-transforms them (`10**x`) so the map rendering follows a log distribution while the legend labels remain in true ppm.
+- **Custom Contiguous Labels**: Generates non-overlapping range labels rounded *UP* to 1 decimal place (e.g., `"4.0 - 5.1"`, `"5.2 - 6.8"`). Includes floating-point noise absorption so values like `4.0001` correctly become `4.0` instead of `4.1`.
+- **Color Ramp Preservation**: Applies the "Prediction" color ramp from the ArcGIS Colors style. Uses a hybrid `arcpy.mp` + CIM approach to ensure Pro generates the colors internally and preserves them without falling back to flat black/red.
+- **Layer Blend Mode**: Locks the layer blend mode to **Multiply** directly in the CIM definition so it persists reliably.
+- **Descending Legend**: Sets the legend order so the highest concentrations appear at the top.
+- **Automated Map Export**: Optional phase to toggle each layer visible, export a high-resolution TIFF, and hide it again.
 
 ## Requirements
 
-* ArcGIS Pro
-* Spatial Analyst Extension
-* Python environment included with ArcGIS Pro
-* NumPy
-* arcpy
+- **ArcGIS Pro** (3.x recommended)
+- **Spatial Analyst** extension license
+- **Python 3.x** (comes bundled with ArcGIS Pro)
+- **NumPy** (comes bundled with ArcGIS Pro)
+- An active ArcGIS Pro project with the target map open.
 
----
+## Setup & Configuration
 
-## Input
+Open the script in the ArcGIS Pro Python editor (or your preferred IDE) and modify the parameters in the **Inputs and parameters** section at the top of the script:
 
-Point feature class containing geochemical measurements.
+```python
+IN_POINTS = "As mg/kg"               # Name of the input point layer
+Z_FIELDS = ["As", "Ba", "Ca", ...]   # List of z-value fields to interpolate
+OUT_FOLDER = r"C:\Path\To\Output"    # Directory to save rasters and maps
 
-Each selected field should contain numeric concentration values.
+OUT_CELL_SIZE = 50
+POWER = 2
+SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
 
----
+NUM_CLASSES = 7
+COLOR_RAMP_NAME = "Prediction"       # Must exist in project styles
+
+RUN_IDW = True                       # Set to False to only re-apply symbology
+EXPORT_LOG_MAPS = False              # Set to True to export TIFFs
+```
+
+## How to Run
+
+1. Open your ArcGIS Pro project.
+2. Ensure the input point layer (`IN_POINTS`) and boundary masks (if referenced in `env_kwargs`) are loaded in the active map.
+3. Open the Python pane (`View` -> `Python`) or run the script via the ArcGIS Pro Python environment.
+4. Execute the script. 
+
+*Note: Because the script uses `arcpy.mp.ArcGISProject("CURRENT")`, it must be run from within an open ArcGIS Pro session.*
+
+## Technical Notes & CIM Workarounds
+
+ArcGIS Pro's standard `arcpy.mp` symbology API has several known quirks that this script deliberately bypasses using the CIM (Cartographic Information Model):
+
+1. **Manual Interval Enum String**: `arcpy.mp` uses `"ManualInterval"`, but the CIM API requires the exact string `"Manual"`. Using the wrong string causes Pro to silently fall back to *Defined Interval* or *Natural Breaks*. The script handles this correctly in the CIM pass.
+2. **Stale `numberFormat` Property**: Mutating an existing CIM colorizer often leaves a stale `numberFormat` object that causes Pro to discard custom range labels and auto-generate bare numbers. This script explicitly clears `numberFormat` and `deviationInterval`.
+3. **Color Ramp Sampling Bugs**: `MappingColorRampObject` in some Pro versions does not support `readColors()` and will throw an error. This script allows `arcpy.mp` to apply the ramp and generate the colors internally, then mutates the bounds/labels while *preserving* the generated colors.
+4. **Layer Blend Mode**: The CIM property is `"blendingMode"` (not `"blendMode"`). Setting the wrong property silently does nothing. The script locks `Multiply` directly in the CIM XML.
 
 ## Output
 
-For every element the script generates:
-
-* IDW raster (.tif)
-* Classified raster layer
-* Manual Interval symbology
-* Rounded legend labels
-* Stored class breaks in `idw_breaks.json`
-
----
-
-## Usage
-
-### Run interpolation and symbology
-
-```python
-RUN_IDW = True
-```
-
-### Apply symbology only to existing rasters
-
-```python
-RUN_IDW = False
-```
-
----
-
-## How It Works
-
-1. Reads point measurements.
-2. Computes percentile break values.
-3. Runs IDW interpolation.
-4. Calculates raster statistics.
-5. Adds rasters to the active ArcGIS Pro map.
-6. Applies Manual Interval classified symbology.
-7. Locks classification using the ArcGIS CIM.
-8. Performs a second verification pass to correct any reverted layers.
-
----
-
-## Key Technical Details
-
-The script addresses several ArcGIS Pro symbology behaviors, including:
-
-* Difference between `ManualInterval` (arcpy.mp) and `Manual` (CIM)
-* Explicit class label assignment
-* Persistent manual class breaks
-* Automatic recovery if ArcGIS reverts layers to Stretch or Standard Deviation rendering
-* Consistent symbology across multiple rasters
-
----
-
-## Example Applications
-
-* Geochemical mapping
-* Environmental contamination studies
-* Soil chemistry visualization
-* Mineral exploration
-* Heavy metal distribution mapping
-* Environmental baseline surveys
-
----
-
-## License
-
-MIT License
-
----
-
-## Author
-
-Nikolaos Avgoustatos
+- **Rasters**: Saves IDW interpolated rasters as `.tif` files in the specified `OUT_FOLDER`.
+- **Map Layers**: Adds the rasters to the active map with the log-scaled symbology, custom labels, descending legend, and Multiply blend mode applied.
+- **Exports** (Optional): If `EXPORT_LOG_MAPS = True`, high-resolution TIFFs for each element are saved to the `log_maps` subfolder.
