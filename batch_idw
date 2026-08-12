@@ -6,12 +6,12 @@ Classification:
     (10**x) so the raster classification follows the log distribution while the
     legend labels stay in true ppm.
 Color Ramp:
-    "Prediction" (pulled from ArcGIS Colors style by name). Colors are sampled
-    directly from the ramp via readColors() — NOT read back from the layer's
-    symbology (which was returning black on re-runs).
+    "Prediction" (pulled from ArcGIS Colors style by name). Applied via arcpy.mp
+    so Pro generates the colors internally. The CIM pass modifies the bounds and
+    labels but preserves the colors Pro generated.
 Labels:
     Contiguous, non-overlapping ranges rounded UP to 1 decimal place.
-    Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0" (always keeping 1 
+    Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0" (always keeping 1
     decimal place, so 4 becomes 4.0, 4.55 becomes 4.6).
 Legend:
     Descending order (highest concentrations at top).
@@ -48,13 +48,8 @@ NUM_CLASSES = 7
 COLOR_RAMP_NAME = "Prediction"       # exact name in ArcGIS Colors style
 LOG_MIN_FLOOR = 1e-6                 # avoid log10(0) for near-zero minimums
 
-# Fallback ramp (blue -> red) used ONLY if the named ramp truly can't be
-# sampled for a given break. Distinct colors beat identical flat-red classes.
-FALLBACK_RAMP = [(49, 54, 149), (116, 173, 209), (255, 255, 191),
-                  (253, 174, 97), (215, 48, 39)]
-
 # True = run IDW + symbology. False = fix symbology on existing rasters/layers only.
-RUN_IDW = False
+RUN_IDW = True
 
 # True = export one TIFF per element with the log-scaled symbology.
 EXPORT_LOG_MAPS = False
@@ -73,18 +68,18 @@ _PREDICTION_RAMP_CACHE = None
 # ---------------------------------------------------------------------------
 def ceil_to_decimal(value, decimals=1):
     """Round UP (toward +inf) to a fixed number of decimal places.
-    
-    Includes a tolerance so that a value like 4.0001 absorbs the floating 
+   
+    Includes a tolerance so that a value like 4.0001 absorbs the floating
     point noise and correctly becomes 4.0 instead of jumping to 4.1.
     """
     factor = 10 ** decimals
     scaled = value * factor
-    
+   
     # If scaled is within 1e-3 above an integer, treat it as that integer
     # to absorb floating point dust (e.g. 4.0001 -> 40.001 -> 40.0)
     if scaled - math.floor(scaled) <= 1e-3:
         return math.floor(scaled) / factor
-    
+   
     return math.ceil(scaled) / factor
 
 
@@ -114,44 +109,6 @@ def build_class_labels(breaks):
 # ---------------------------------------------------------------------------
 # Color helpers
 # ---------------------------------------------------------------------------
-def rgb_to_cim_color(r, g, b, a=100):
-    cim_color = arcpy.cim.CreateCIMObjectFromClassName("CIMRGBColor", "V2")
-    cim_color.values = [int(r), int(g), int(b), int(a)]
-    cim_color.colorSpace = arcpy.cim.CreateCIMObjectFromClassName("CIMICCColorSpace", "V2")
-    cim_color.colorSpace.url = "Default RGB profile"
-    return cim_color
-
-
-def arcpy_color_to_cim(arcpy_color):
-    """Convert an arcpy.mp.Color (or similar RGB-bearing object) to CIMRGBColor."""
-    if hasattr(arcpy_color, "RGB"):
-        r, g, b = arcpy_color.RGB[:3]
-    else:
-        r = int(getattr(arcpy_color, "red", 0))
-        g = int(getattr(arcpy_color, "green", 0))
-        b = int(getattr(arcpy_color, "blue", 0))
-    a = int(getattr(arcpy_color, "alpha", 100))
-    return rgb_to_cim_color(r, g, b, a)
-
-
-def fallback_color_for_index(i, n):
-    """Deterministic, visually distinct fallback color - never flat red for
-    every class. Linearly interpolates across FALLBACK_RAMP."""
-    if n <= 1:
-        t = 0.0
-    else:
-        t = i / (n - 1)
-    stops = FALLBACK_RAMP
-    scaled = t * (len(stops) - 1)
-    lo = int(math.floor(scaled))
-    hi = min(lo + 1, len(stops) - 1)
-    frac = scaled - lo
-    r = stops[lo][0] + (stops[hi][0] - stops[lo][0]) * frac
-    g = stops[lo][1] + (stops[hi][1] - stops[lo][1]) * frac
-    b = stops[lo][2] + (stops[hi][2] - stops[lo][2]) * frac
-    return rgb_to_cim_color(r, g, b, 100)
-
-
 def get_prediction_ramp(force_refresh=False):
     """Pull the 'Prediction' color ramp from project styles (cached)."""
     global _PREDICTION_RAMP_CACHE
@@ -169,22 +126,6 @@ def get_prediction_ramp(force_refresh=False):
         )
     _PREDICTION_RAMP_CACHE = ramps[0]
     return _PREDICTION_RAMP_CACHE
-
-
-def sample_ramp_colors(ramp, num_classes):
-    """Sample N colors directly from a ColorRamp using readColors().
-
-    This is the reliable way to get colors from the named ramp. The previous
-    approach of reading colors back from the layer's arcpy.mp symbology was
-    unreliable on re-runs (returned black/empty colors).
-    """
-    try:
-        colors = ramp.readColors(num_classes)
-        if colors and len(colors) >= num_classes:
-            return [arcpy_color_to_cim(c) for c in colors[:num_classes]]
-    except Exception as exc:
-        print(f"    NOTE: ramp.readColors() failed: {exc}")
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -233,44 +174,6 @@ def build_log_breaks_and_labels(raw_min, raw_max, num_classes, floor_min=LOG_MIN
 # ---------------------------------------------------------------------------
 # Symbology Application
 # ---------------------------------------------------------------------------
-def update_colorizer_cim(colorizer, breaks, labels, cim_colors):
-    """Configure a CIMRasterClassifyColorizer for log-spaced breaks.
-
-    This function is designed to work on a FRESH colorizer object (created
-    via CreateCIMObjectFromClassName), NOT on a pre-existing one. This avoids
-    stale properties (numberFormat, deviationInterval, etc.) from previous
-    runs that were overriding our custom labels and colors.
-    """
-    upper_values = breaks[1:]
-    n = len(upper_values)
-
-    class_breaks = []
-    for i in range(n):
-        cb = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassBreak", "V2")
-        cb.upperBound = float(upper_values[i])
-        cb.label = labels[i]
-        cb.color = cim_colors[i]
-        class_breaks.append(cb)
-
-    colorizer.classBreakType = "ClassBreaks"
-    # CIM uses "Manual" (arcpy.mp uses "ManualInterval" - they're different!)
-    colorizer.classificationMethod = "Manual"
-    colorizer.field = "Value"
-    colorizer.resamplingType = "BilinearInterpolation"
-    colorizer.minimumBreak = float(breaks[0])
-
-    # REVERSED ORDER IN LEGEND: highest values appear at the top
-    colorizer.showInAscendingOrder = False
-
-    colorizer.classBreaks = class_breaks
-    colorizer.numberOfBreaks = len(class_breaks)
-
-    # NOTE: Do NOT set numberFormat or deviationInterval to None here.
-    # On a fresh colorizer they don't exist yet, and setting them to None
-    # on a pre-existing colorizer was causing Pro to auto-regenerate labels
-    # from the upper bounds, discarding our custom labels.
-
-
 def get_class_break_count(colorizer):
     breaks = getattr(colorizer, "classBreaks", None)
     if breaks is not None:
@@ -282,14 +185,12 @@ def get_class_break_count(colorizer):
 
 
 def is_classified(layer):
-    """Check if layer has proper classification."""
+    """Check if layer has proper Manual classification."""
     cim = layer.getDefinition("V2")
     colorizer = cim.colorizer
     if colorizer is None:
         return False
     if type(colorizer).__name__ != "CIMRasterClassifyColorizer":
-        return False
-    if getattr(colorizer, "classBreakType", None) != "ClassBreaks":
         return False
     return get_class_break_count(colorizer) == NUM_CLASSES
 
@@ -328,13 +229,11 @@ def apply_symbology(layer, raster_path, num_classes=NUM_CLASSES, floor_min=LOG_M
     ramp = get_prediction_ramp()
 
     # Step 1: Ensure the layer has a RasterClassifyColorizer with the ramp set.
-    # This is a minimal setup — the CIM pass (Step 3) does the heavy lifting.
+    # This forces Pro to generate the 7 class break colors internally.
     sym = layer.symbology
     if hasattr(sym, "colorizer"):
         if sym.colorizer.type != "RasterClassifyColorizer":
             sym.updateColorizer("RasterClassifyColorizer")
-            # CRITICAL: updateColorizer() only mutates this local, uncommitted
-            # `sym` object — must commit before re-fetching.
             layer.symbology = sym
             sym = layer.symbology
         try:
@@ -346,25 +245,44 @@ def apply_symbology(layer, raster_path, num_classes=NUM_CLASSES, floor_min=LOG_M
         except Exception as exc:
             print(f"    NOTE: mp setup partial failure: {exc}")
 
-    # Step 2: Sample colors DIRECTLY from the Prediction ramp.
-    # This is the key fix — readColors() is reliable on every run, unlike
-    # reading colors back from the layer's symbology which returned black
-    # on re-runs.
-    cim_colors = sample_ramp_colors(ramp, num_classes)
-    if cim_colors is None:
-        print(f"    Using deterministic fallback ramp for {os.path.basename(raster_path)}.")
-        cim_colors = [fallback_color_for_index(i, num_classes) for i in range(num_classes)]
-
-    # Step 3: CIM pass — create a FRESH colorizer to avoid stale properties.
-    # The previous approach mutated the existing colorizer, which retained
-    # a stale numberFormat from the previous run that caused Pro to discard
-    # our custom range labels and show bare numbers instead.
+    # Step 2: CIM pass to lock log-spaced breaks + labels
     cim_layer = layer.getDefinition("V2")
-    new_colorizer = arcpy.cim.CreateCIMObjectFromClassName(
-        "CIMRasterClassifyColorizer", "V2"
-    )
-    update_colorizer_cim(new_colorizer, breaks, labels, cim_colors)
-    cim_layer.colorizer = new_colorizer
+    colorizer = cim_layer.colorizer
+    if colorizer is None or type(colorizer).__name__ != "CIMRasterClassifyColorizer":
+        colorizer = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassifyColorizer", "V2")
+        cim_layer.colorizer = colorizer
+
+    # Clear stale formatting properties that override labels
+    if hasattr(colorizer, "deviationInterval"):
+        try: colorizer.deviationInterval = None
+        except: pass
+    if hasattr(colorizer, "numberFormat"):
+        try: colorizer.numberFormat = None
+        except: pass
+
+    # CRITICAL: In the CIM API, the enum string is "Manual". 
+    # Do NOT use "ManualInterval" here, or Pro will default to Defined Interval.
+    colorizer.classBreakType = "ClassBreaks"
+    colorizer.classificationMethod = "Manual"
+    colorizer.field = "Value"
+    colorizer.minimumBreak = float(breaks[0])
+    colorizer.showInAscendingOrder = False
+
+    # Ensure classBreaks list exists and has the correct size
+    class_breaks = getattr(colorizer, "classBreaks", None)
+    if class_breaks is None or len(class_breaks) != num_classes:
+        class_breaks = []
+        for _ in range(num_classes):
+            cb = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassBreak", "V2")
+            class_breaks.append(cb)
+
+    # Update bounds and labels, preserve existing colors Pro generated
+    for i in range(num_classes):
+        class_breaks[i].upperBound = float(breaks[i + 1])
+        class_breaks[i].label = labels[i]
+
+    colorizer.classBreaks = class_breaks
+    colorizer.numberOfBreaks = len(class_breaks)
     cim_layer.expanded = False
 
     # Layer Blend Mode — DO NOT CHANGE. This is working correctly.
