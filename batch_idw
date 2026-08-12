@@ -1,10 +1,11 @@
 """
-Batch IDW interpolation with log-scaled classified symbology.
+Batch IDW interpolation with percentile-based classified symbology.
 
 Classification:
-    N_CLASSES breaks evenly spaced in log10 space, upperBounds back-transformed
-    (10**x) so the raster classification follows the log distribution while the
-    legend labels stay in true ppm.
+    7 classes based on percentiles from the sample points:
+    min -> 5th -> 25th (1st quartile) -> 50th (median) -> 75th (3rd quartile) -> 90th -> 95th -> max.
+    Break VALUES are exact; LABELS are contiguous, non-overlapping ranges 
+    rounded UP to 1 decimal place.
 Color Ramp:
     "Prediction" (pulled from ArcGIS Colors style by name). Applied via arcpy.mp
     so Pro generates the colors internally. The CIM pass modifies the bounds and
@@ -44,14 +45,14 @@ POWER = 2
 SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
 IN_BARRIER = ""
 
+PERCENTILES = [5, 25, 50, 75, 90, 95]
 NUM_CLASSES = 7
 COLOR_RAMP_NAME = "Prediction"       # exact name in ArcGIS Colors style
-LOG_MIN_FLOOR = 1e-6                 # avoid log10(0) for near-zero minimums
 
 # True = run IDW + symbology. False = fix symbology on existing rasters/layers only.
 RUN_IDW = True
 
-# True = export one TIFF per element with the log-scaled symbology.
+# True = export one TIFF per element with the scaled symbology.
 EXPORT_LOG_MAPS = False
 EXPORT_DPI = 300
 EXPORT_WIDTH = 2400
@@ -136,39 +137,37 @@ def raster_path_for_field(field):
 
 
 # ---------------------------------------------------------------------------
-# Log breaks from raster min/max
+# Percentile breaks from sample points
 # ---------------------------------------------------------------------------
-def get_raster_min_max(raster_path):
-    """Return (min, max) of a raster, forcing statistics first."""
-    try:
-        arcpy.management.CalculateStatistics(raster_path)
-    except Exception as exc:
-        print(f"    WARNING: CalculateStatistics failed for {raster_path}: {exc}")
-    raster = arcpy.Raster(raster_path)
-    rmin, rmax = raster.minimum, raster.maximum
-    if rmin is None or rmax is None:
-        raise RuntimeError(
-            f"Raster {raster_path} has no min/max statistics "
-            "(CalculateStatistics may have failed, or raster is all-NoData)."
-        )
-    return float(rmin), float(rmax)
+def get_percentile_breaks_from_points(points_fc, field, pct_list):
+    """Build 8 break points (7 classes) from sample points.
 
+    All values (min, percentiles, max) are kept exact/unrounded floats.
+    Rounding is applied ONLY at label-display time, not here.
+    """
+    vals = []
+    with arcpy.da.SearchCursor(points_fc, [field]) as cursor:
+        for row in cursor:
+            if row[0] is not None:
+                vals.append(row[0])
 
-def build_log_breaks_and_labels(raw_min, raw_max, num_classes, floor_min=LOG_MIN_FLOOR):
-    """Build N+1 break points evenly spaced in log10 space, plus N labels."""
-    if raw_min <= 0:
-        raw_min = floor_min
-    if raw_max <= raw_min:
-        raw_max = raw_min * 10.0
+    if not vals:
+        raise ValueError(f"No valid values found for field '{field}' in {points_fc}.")
 
-    log_min = math.log10(raw_min)
-    log_max = math.log10(raw_max)
-    log_breaks = np.linspace(log_min, log_max, num_classes + 1)
-    breaks = [float(10 ** x) for x in log_breaks]
+    arr = np.array(vals, dtype=float)
 
-    labels = build_class_labels(breaks)
+    breaks = [float(np.min(arr))]
+    for p in pct_list:
+        v = float(np.percentile(arr, p))
+        breaks.append(v)
+    breaks.append(float(np.max(arr)))
 
-    return breaks, labels
+    # Ensure strictly increasing
+    for i in range(1, len(breaks)):
+        if breaks[i] <= breaks[i - 1]:
+            breaks[i] = breaks[i - 1] + 1e-6
+
+    return breaks
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +218,8 @@ def ensure_layer_on_map(active_map, field, raster_path):
     return layer
 
 
-def apply_symbology(layer, raster_path, num_classes=NUM_CLASSES, floor_min=LOG_MIN_FLOOR):
-    """Apply log-scaled classified symbology to a raster layer."""
-    raw_min, raw_max = get_raster_min_max(raster_path)
-    breaks, labels = build_log_breaks_and_labels(
-        raw_min, raw_max, num_classes, floor_min
-    )
-
+def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES):
+    """Apply classified symbology to a raster layer."""
     ramp = get_prediction_ramp()
 
     # Step 1: Ensure the layer has a RasterClassifyColorizer with the ramp set.
@@ -245,7 +239,7 @@ def apply_symbology(layer, raster_path, num_classes=NUM_CLASSES, floor_min=LOG_M
         except Exception as exc:
             print(f"    NOTE: mp setup partial failure: {exc}")
 
-    # Step 2: CIM pass to lock log-spaced breaks + labels
+    # Step 2: CIM pass to lock breaks + labels
     cim_layer = layer.getDefinition("V2")
     colorizer = cim_layer.colorizer
     if colorizer is None or type(colorizer).__name__ != "CIMRasterClassifyColorizer":
@@ -293,7 +287,7 @@ def apply_symbology(layer, raster_path, num_classes=NUM_CLASSES, floor_min=LOG_M
     return breaks, labels
 
 
-def apply_symbology_for_field(active_map, field):
+def apply_symbology_for_field(active_map, field, breaks, labels):
     raster_path = raster_path_for_field(field)
     layer_name = f"IDW_{field}"
 
@@ -305,7 +299,7 @@ def apply_symbology_for_field(active_map, field):
     last_exc = None
     for attempt in (1, 2):
         try:
-            apply_symbology(layer, raster_path)
+            apply_symbology(layer, raster_path, breaks, labels)
         except Exception as exc:
             last_exc = exc
             print(f"    {layer_name}: attempt {attempt} raised: {exc}")
@@ -330,7 +324,7 @@ def export_element_maps(active_map, output_folder):
     """For each element field: make the layer visible, export the map view
     to TIFF, then hide the layer again.
     """
-    print("\n=== Exporting element maps with log-scaled symbology ===")
+    print("\n=== Exporting element maps with percentile symbology ===")
 
     # Hide all element layers first
     for field in Z_FIELDS:
@@ -366,7 +360,9 @@ def export_element_maps(active_map, output_folder):
             layer.visible = True
 
             # Ensure symbology is locked (in case map reverted it)
-            apply_symbology(layer, raster_path)
+            breaks = get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
+            labels = build_class_labels(breaks)
+            apply_symbology(layer, raster_path, breaks, labels)
 
             if active_view:
                 try:
@@ -473,12 +469,14 @@ def main():
             else:
                 print("Phase 1 skipped (RUN_IDW = False).")
 
-            # Phase 2: Log-scaled symbology on map layers
-            print("\nPhase 2: Applying log-scaled (Prediction) symbology to all layers...")
+            # Phase 2: Percentile symbology on map layers
+            print("\nPhase 2: Applying percentile (Prediction) symbology to all layers...")
             for field in Z_FIELDS:
                 layer_name = f"IDW_{field}"
                 try:
-                    layer, ok = apply_symbology_for_field(active_map, field)
+                    breaks = get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
+                    labels = build_class_labels(breaks)
+                    layer, ok = apply_symbology_for_field(active_map, field, breaks, labels)
                     status = "OK" if ok else "FAILED"
                     print(f"  {layer_name}: {status}")
                     if not ok:
