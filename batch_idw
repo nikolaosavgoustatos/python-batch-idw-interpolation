@@ -4,7 +4,7 @@ Batch IDW interpolation with percentile-based classified symbology.
 Classification:
     7 classes based on percentiles from the sample points:
     min -> 5th -> 25th (1st quartile) -> 50th (median) -> 75th (3rd quartile) -> 90th -> 95th -> max.
-    Break VALUES are kept as EXACT floats (no rounding) so the classification 
+    Break VALUES are kept as EXACT floats (no rounding) so the classification
     mathematically matches the data distribution.
 Color Ramp:
     "Prediction" (pulled from ArcGIS Colors style by name). Applied via arcpy.mp
@@ -12,7 +12,7 @@ Color Ramp:
     labels but preserves the colors Pro generated.
 Labels:
     Contiguous, non-overlapping ranges representing (x, y] intervals.
-    First lower bound: ceil_to_decimal(min). 
+    First lower bound: ceil_to_decimal(min).
     Subsequent lower bounds: ceil_to_decimal(prev_upper) + 0.1.
     Upper bounds: ceil_to_decimal(exact_break).
     Formatted with exactly 1 decimal place (e.g. "4.0 - 5.1", "5.2 - 6.8").
@@ -257,7 +257,7 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
         try: colorizer.numberFormat = None
         except: pass
 
-    # CRITICAL: In the CIM API, the enum string is "Manual". 
+    # CRITICAL: In the CIM API, the enum string is "Manual".
     # Do NOT use "ManualInterval" here, or Pro will default to Defined Interval.
     colorizer.classBreakType = "ClassBreaks"
     colorizer.classificationMethod = "Manual"
