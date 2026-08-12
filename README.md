@@ -1,13 +1,17 @@
-# ArcGIS Pro Batch IDW & Log-Scaled Symbology
+Here is a complete and professional `README.md` formatted specifically for your GitHub repository. You can copy and paste this directly into a `README.md` file in your repo.
 
-This Python script automates Inverse Distance Weighting (IDW) interpolation for multiple geochemical elements and applies highly customized, log-scaled classified symbology. It is designed to run inside an active ArcGIS Pro project and leverages both the `arcpy.mp` API and direct CIM (Cartographic Information Model) manipulation to bypass standard UI limitations.
+***
+
+# ArcGIS Pro Batch IDW & Percentile Symbology Automation
+
+This Python script automates Inverse Distance Weighting (IDW) interpolation for multiple geochemical elements and applies highly customized, percentile-based classified symbology. It is designed to run inside an active ArcGIS Pro project and leverages a hybrid `arcpy.mp` and direct CIM (Cartographic Information Model) manipulation approach to bypass standard API limitations and UI quirks.
 
 ## Key Features
 
 - **Batch IDW Interpolation**: Processes multiple trace elements (As, Ba, Ca, Cr, Cu, Fe, Mn, Ni, Pb, Rb, Sr, Ti, V, Zn) from a single input point feature class.
-- **Log-Scaled Classification**: Generates classification breaks evenly spaced in `log10` space, then back-transforms them (`10**x`) so the map rendering follows a log distribution while the legend labels remain in true ppm.
-- **Custom Contiguous Labels**: Generates non-overlapping range labels rounded *UP* to 1 decimal place (e.g., `"4.0 - 5.1"`, `"5.2 - 6.8"`). Includes floating-point noise absorption so values like `4.0001` correctly become `4.0` instead of `4.1`.
-- **Color Ramp Preservation**: Applies the "Prediction" color ramp from the ArcGIS Colors style. Uses a hybrid `arcpy.mp` + CIM approach to ensure Pro generates the colors internally and preserves them without falling back to flat black/red.
+- **Percentile-Based Classification**: Generates 7 classes strictly based on sample point distribution: `min` → `5th` → `25th` (1st Quartile) → `50th` (Median) → `75th` (3rd Quartile) → `90th` → `95th` → `max`.
+- **Custom Contiguous Labels**: Generates non-overlapping range labels rounded *UP* to 1 decimal place (e.g., `"4.0 - 5.1"`, `"5.2 - 6.8"`). Includes floating-point noise absorption so values like `4.0001` correctly become `4.0` instead of jumping to `4.1`.
+- **Color Ramp Preservation**: Applies the "Prediction" color ramp from the ArcGIS Colors style. Uses `arcpy.mp` to let Pro generate the colors internally, then safely modifies the bounds and labels via CIM without losing the generated colors.
 - **Layer Blend Mode**: Locks the layer blend mode to **Multiply** directly in the CIM definition so it persists reliably.
 - **Descending Legend**: Sets the legend order so the highest concentrations appear at the top.
 - **Automated Map Export**: Optional phase to toggle each layer visible, export a high-resolution TIFF, and hide it again.
@@ -33,6 +37,7 @@ OUT_CELL_SIZE = 50
 POWER = 2
 SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
 
+PERCENTILES = [5, 25, 50, 75, 90, 95]
 NUM_CLASSES = 7
 COLOR_RAMP_NAME = "Prediction"       # Must exist in project styles
 
@@ -56,10 +61,4 @@ ArcGIS Pro's standard `arcpy.mp` symbology API has several known quirks that thi
 1. **Manual Interval Enum String**: `arcpy.mp` uses `"ManualInterval"`, but the CIM API requires the exact string `"Manual"`. Using the wrong string causes Pro to silently fall back to *Defined Interval* or *Natural Breaks*. The script handles this correctly in the CIM pass.
 2. **Stale `numberFormat` Property**: Mutating an existing CIM colorizer often leaves a stale `numberFormat` object that causes Pro to discard custom range labels and auto-generate bare numbers. This script explicitly clears `numberFormat` and `deviationInterval`.
 3. **Color Ramp Sampling Bugs**: `MappingColorRampObject` in some Pro versions does not support `readColors()` and will throw an error. This script allows `arcpy.mp` to apply the ramp and generate the colors internally, then mutates the bounds/labels while *preserving* the generated colors.
-4. **Layer Blend Mode**: The CIM property is `"blendingMode"` (not `"blendMode"`). Setting the wrong property silently does nothing. The script locks `Multiply` directly in the CIM XML.
-
-## Output
-
-- **Rasters**: Saves IDW interpolated rasters as `.tif` files in the specified `OUT_FOLDER`.
-- **Map Layers**: Adds the rasters to the active map with the log-scaled symbology, custom labels, descending legend, and Multiply blend mode applied.
-- **Exports** (Optional): If `EXPORT_LOG_MAPS = True`, high-resolution TIFFs for each element are saved to the `log_maps` subfolder.
+4. **Layer Blend Mode**: The CIM property is `"blendingMode"` (not `"blendMode"`). Setting the wrong property silently does nothing. The script locks `Multiply` directly in the CIM definition.
