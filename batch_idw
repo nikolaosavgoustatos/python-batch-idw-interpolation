@@ -4,16 +4,18 @@ Batch IDW interpolation with percentile-based classified symbology.
 Classification:
     7 classes based on percentiles from the sample points:
     min -> 5th -> 25th (1st quartile) -> 50th (median) -> 75th (3rd quartile) -> 90th -> 95th -> max.
-    Break VALUES are exact; LABELS are contiguous, non-overlapping ranges 
-    rounded UP to 1 decimal place.
+    Break VALUES are kept as EXACT floats (no rounding) so the classification 
+    mathematically matches the data distribution.
 Color Ramp:
     "Prediction" (pulled from ArcGIS Colors style by name). Applied via arcpy.mp
     so Pro generates the colors internally. The CIM pass modifies the bounds and
     labels but preserves the colors Pro generated.
 Labels:
-    Contiguous, non-overlapping ranges rounded UP to 1 decimal place.
-    Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0" (always keeping 1
-    decimal place, so 4 becomes 4.0, 4.55 becomes 4.6).
+    Contiguous, non-overlapping ranges representing (x, y] intervals.
+    First lower bound: ceil_to_decimal(min). 
+    Subsequent lower bounds: ceil_to_decimal(prev_upper) + 0.1.
+    Upper bounds: ceil_to_decimal(exact_break).
+    Formatted with exactly 1 decimal place (e.g. "4.0 - 5.1", "5.2 - 6.8").
 Legend:
     Descending order (highest concentrations at top).
 Layer Blend:
@@ -93,6 +95,7 @@ def format_decimal(value):
 def build_class_labels(breaks):
     """Build contiguous, non-overlapping labels with 1 decimal ceil rounding.
     Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0".
+    Represents the mathematical interval (x, y].
     """
     labels = []
     for i in range(len(breaks) - 1):
@@ -142,7 +145,7 @@ def raster_path_for_field(field):
 def get_percentile_breaks_from_points(points_fc, field, pct_list):
     """Build 8 break points (7 classes) from sample points.
 
-    All values (min, percentiles, max) are kept exact/unrounded floats.
+    All values (min, percentiles, max) are kept EXACT/unrounded floats.
     Rounding is applied ONLY at label-display time, not here.
     """
     vals = []
@@ -270,7 +273,7 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
             cb = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassBreak", "V2")
             class_breaks.append(cb)
 
-    # Update bounds and labels, preserve existing colors Pro generated
+    # Update bounds (EXACT values) and labels, preserve existing colors Pro generated
     for i in range(num_classes):
         class_breaks[i].upperBound = float(breaks[i + 1])
         class_breaks[i].label = labels[i]
