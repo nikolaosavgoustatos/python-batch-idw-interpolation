@@ -12,10 +12,11 @@ Color Ramp:
     labels but preserves the colors Pro generated.
 Labels:
     Contiguous, non-overlapping ranges representing (x, y] intervals.
-    First lower bound: ceil_to_decimal(min).
-    Subsequent lower bounds: ceil_to_decimal(prev_upper) + 0.1.
-    Upper bounds: ceil_to_decimal(exact_break).
-    Formatted with exactly 1 decimal place (e.g. "4.0 - 5.1", "5.2 - 6.8").
+    First lower bound: round_half_up(min).
+    Subsequent lower bounds: round_half_up(previous_break) + 0.1.
+    Upper bounds: round_half_up(exact_break).
+    Break VALUES themselves are never rounded.
+    Formatted with exactly 1 decimal place.
 Legend:
     Descending order (highest concentrations at top).
 Layer Blend:
@@ -69,44 +70,50 @@ _PREDICTION_RAMP_CACHE = None
 # ---------------------------------------------------------------------------
 # Rounding / formatting helpers
 # ---------------------------------------------------------------------------
-def ceil_to_decimal(value, decimals=1):
-    """Round UP (toward +inf) to a fixed number of decimal places.
-   
-    Includes a tolerance so that a value like 4.0001 absorbs the floating
-    point noise and correctly becomes 4.0 instead of jumping to 4.1.
+def round_half_up(value, decimals=1):
+    """Standard half-up rounding (e.g. 5.05 -> 5.1).
+    
+    Python's built-in round() uses banker's rounding (half-to-even), so 
+    round(5.05, 1) returns 5.0. This function guarantees that .05 goes up.
+    Only used for display labels; actual break values remain unrounded.
     """
-    factor = 10 ** decimals
-    scaled = value * factor
-   
-    # If scaled is within 1e-3 above an integer, treat it as that integer
-    # to absorb floating point dust (e.g. 4.0001 -> 40.001 -> 40.0)
-    if scaled - math.floor(scaled) <= 1e-3:
-        return math.floor(scaled) / factor
-   
-    return math.ceil(scaled) / factor
+    multiplier = 10 ** decimals
+    return math.floor(float(value) * multiplier + 0.5) / multiplier
 
 
 def format_decimal(value):
-    """Format with EXACTLY 1 decimal place (e.g. 4 -> 4.0, 4.55 -> 4.6)."""
-    # Using Python's standard formatting safely rounds and keeps the .0
+    """Always display exactly one decimal place."""
     return f"{value:.1f}"
 
 
 def build_class_labels(breaks):
-    """Build contiguous, non-overlapping labels with 1 decimal ceil rounding.
-    Formatted as "min - X.0", "X.1 - Y.0", "Y.1 - max.0".
-    Represents the mathematical interval (x, y].
+    """Build legend labels from exact percentile values using half-up rounding.
+
+    Exact break values are never modified. Only the displayed label is rounded.
+
+    Example:
+        exact breaks = 4.23, 5.01, 6.74, 8.16
+
+        labels =
+            4.2 - 5.0
+            5.1 - 6.7
+            6.8 - 8.2
     """
     labels = []
+
     for i in range(len(breaks) - 1):
         if i == 0:
-            lower = ceil_to_decimal(float(breaks[0]))
+            lower = round_half_up(breaks[0])
         else:
-            # Calculate previous upper bound, add 0.1 for the next lower bound
-            prev_upper = ceil_to_decimal(float(breaks[i]))
-            lower = prev_upper + 0.1
-        upper = ceil_to_decimal(float(breaks[i + 1]))
-        labels.append(f"{format_decimal(lower)} - {format_decimal(upper)}")
+            previous_upper = round_half_up(breaks[i])
+            lower = previous_upper + 0.1
+
+        upper = round_half_up(breaks[i + 1])
+
+        labels.append(
+            f"{format_decimal(lower)} - {format_decimal(upper)}"
+        )
+
     return labels
 
 
