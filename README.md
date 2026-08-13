@@ -1,7 +1,3 @@
-Here is a professional, comprehensive `README.md` formatted for GitHub. It explains what the script does, how it works, the configuration parameters, and how to run it.
-
-***
-
 # ArcGIS Pro Batch IDW Interpolation & Percentile Symbology
 
 This Python script automates the spatial interpolation of geochemical point data (e.g., soil or sediment samples) using Inverse Distance Weighting (IDW) in ArcGIS Pro. It calculates exact percentile-based classification breaks from the original point data, generates IDW rasters for multiple elements, and applies highly customized classified symbology with precise legend formatting.
