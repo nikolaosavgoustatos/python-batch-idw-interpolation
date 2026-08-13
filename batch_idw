@@ -4,8 +4,8 @@ Batch IDW interpolation with percentile-based classified symbology.
 Classification:
     7 classes based on percentiles from the sample points:
     min -> 5th -> 25th (1st quartile) -> 50th (median) -> 75th (3rd quartile) -> 90th -> 95th -> max.
-    Break VALUES are kept as EXACT floats (no rounding) so the classification
-    mathematically matches the data distribution.
+    Break VALUES are rounded with half-up rounding (same as labels) so the
+    classification values and display labels are consistent.
 Color Ramp:
     "Prediction" (pulled from ArcGIS Colors style by name). Applied via arcpy.mp
     so Pro generates the colors internally. The CIM pass modifies the bounds and
@@ -15,7 +15,7 @@ Labels:
     First lower bound: round_half_up(min).
     Subsequent lower bounds: round_half_up(previous_break) + 0.1.
     Upper bounds: round_half_up(exact_break).
-    Break VALUES themselves are never rounded.
+    Upper bound VALUES in CIM also use round_half_up(exact_break) — same rounding.
     Formatted with exactly 1 decimal place.
 Legend:
     Descending order (highest concentrations at top).
@@ -75,7 +75,7 @@ def round_half_up(value, decimals=1):
     
     Python's built-in round() uses banker's rounding (half-to-even), so 
     round(5.05, 1) returns 5.0. This function guarantees that .05 goes up.
-    Only used for display labels; actual break values remain unrounded.
+    Used for BOTH break values and display labels so they are consistent.
     """
     multiplier = 10 ** decimals
     return math.floor(float(value) * multiplier + 0.5) / multiplier
@@ -87,9 +87,10 @@ def format_decimal(value):
 
 
 def build_class_labels(breaks):
-    """Build legend labels from exact percentile values using half-up rounding.
+    """Build legend labels from percentile values using half-up rounding.
 
-    Exact break values are never modified. Only the displayed label is rounded.
+    Both the displayed label AND the actual break upperBound use the same
+    round_half_up() value, ensuring full consistency.
 
     Example:
         exact breaks = 4.23, 5.01, 6.74, 8.16
@@ -115,6 +116,21 @@ def build_class_labels(breaks):
         )
 
     return labels
+
+
+def build_rounded_breaks(breaks):
+    """Round all break values with half-up rounding (1 decimal).
+
+    Returns a new list where:
+      - breaks[0] (min) -> round_half_up(min)   [used as minimumBreak]
+      - breaks[i+1]      -> round_half_up(breaks[i+1])  [used as upperBound]
+
+    This ensures the CIM upperBound values use the SAME rounding as the labels.
+    """
+    rounded = [round_half_up(breaks[0])]
+    for i in range(1, len(breaks)):
+        rounded.append(round_half_up(breaks[i]))
+    return rounded
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +168,9 @@ def raster_path_for_field(field):
 def get_percentile_breaks_from_points(points_fc, field, pct_list):
     """Build 8 break points (7 classes) from sample points.
 
-    All values (min, percentiles, max) are kept EXACT/unrounded floats.
-    Rounding is applied ONLY at label-display time, not here.
+    All values (min, percentiles, max) are computed as exact floats first.
+    Rounding (half-up, 1 decimal) is applied when building labels AND when
+    setting CIM upperBound/minimumBreak values — keeping them consistent.
     """
     vals = []
     with arcpy.da.SearchCursor(points_fc, [field]) as cursor:
@@ -229,8 +246,16 @@ def ensure_layer_on_map(active_map, field, raster_path):
 
 
 def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES):
-    """Apply classified symbology to a raster layer."""
+    """Apply classified symbology to a raster layer.
+
+    Break VALUES (minimumBreak + each upperBound) are rounded with round_half_up()
+    — the SAME rounding used for the labels — so the classification values
+    and display text are fully consistent.
+    """
     ramp = get_prediction_ramp()
+
+    # Pre-compute rounded break values (same rounding as labels)
+    rounded_breaks = build_rounded_breaks(breaks)
 
     # Step 1: Ensure the layer has a RasterClassifyColorizer with the ramp set.
     # This forces Pro to generate the 7 class break colors internally.
@@ -269,7 +294,8 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
     colorizer.classBreakType = "ClassBreaks"
     colorizer.classificationMethod = "Manual"
     colorizer.field = "Value"
-    colorizer.minimumBreak = float(breaks[0])
+    # minimumBreak uses the SAME rounded value as the first label's lower bound
+    colorizer.minimumBreak = float(rounded_breaks[0])
     colorizer.showInAscendingOrder = False
 
     # Ensure classBreaks list exists and has the correct size
@@ -280,9 +306,11 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
             cb = arcpy.cim.CreateCIMObjectFromClassName("CIMRasterClassBreak", "V2")
             class_breaks.append(cb)
 
-    # Update bounds (EXACT values) and labels, preserve existing colors Pro generated
+    # Update bounds (ROUNDED values — same rounding as labels) and labels,
+    # preserve existing colors Pro generated.
     for i in range(num_classes):
-        class_breaks[i].upperBound = float(breaks[i + 1])
+        # upperBound uses round_half_up — SAME as the label's upper bound
+        class_breaks[i].upperBound = float(rounded_breaks[i + 1])
         class_breaks[i].label = labels[i]
 
     colorizer.classBreaks = class_breaks
@@ -294,7 +322,7 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
 
     layer.setDefinition(cim_layer)
 
-    return breaks, labels
+    return rounded_breaks, labels
 
 
 def apply_symbology_for_field(active_map, field, breaks, labels):
