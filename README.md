@@ -1,83 +1,70 @@
 # ArcGIS Pro Batch IDW Interpolation & Percentile Symbology
 
-This Python script automates the spatial interpolation of geochemical point data (e.g., soil or sediment samples) using Inverse Distance Weighting (IDW) in ArcGIS Pro. It calculates exact percentile-based classification breaks from the original point data, generates IDW rasters for multiple elements, and applies highly customized classified symbology with precise legend formatting.
+This Python script automates the workflow of generating Inverse Distance Weighting (IDW) interpolation surfaces from point data in ArcGIS Pro. It applies a highly customized, 7-class percentile-based symbology using the "Prediction" color ramp, and ensures that the classification break values and legend labels are mathematically consistent using standard half-up rounding.
 
 ## Key Features
 
-- **Batch Processing:** Runs IDW interpolation for 14 elements (As, Ba, Ca, Cr, Cu, Fe, Mn, Ni, Pb, Rb, Sr, Ti, V, Zn).
-- **Mathematically Pure Classification:** Extracts percentile breaks (min, 5th, 25th, 50th, 75th, 90th, 95th, max) directly from the sample points. The actual classification break values are kept as exact floats so the raster classification perfectly matches the data distribution.
-- **Custom Legend Formatting:** Generates contiguous, non-overlapping legend ranges (e.g., `4.2 - 5.0`, `5.1 - 6.7`). Display labels use standard half-up rounding (e.g., `5.05` -> `5.1`), while the underlying raster bounds remain exact.
-- **CIM-Level Symbology Locking:** Uses the ArcGIS Pro CIM (Cartographic Information Model) API to lock manual class breaks, apply the "Prediction" color ramp, force descending legend order, and permanently set the layer blend mode to `Multiply`.
-- **Symbology-Only Mode:** Ability to skip interpolation and re-apply/fix symbology on existing raster layers.
-- **Map Exporting:** Optional automated export of per-element TIFF maps with the applied symbology.
+- **Batch IDW Processing:** Iterates through multiple element fields (e.g., As, Ba, Ca, Cr) to generate continuous prediction rasters.
+- **Percentile-Based Classification:** Generates exactly 7 classes based on the data distribution: `Min -> 5th -> 25th -> 50th -> 75th -> 90th -> 95th -> Max`.
+- **Consistent Rounding Logic:** Uses standard half-up rounding (`round_half_up`) for **both** the actual CIM classification bounds and the legend labels. This prevents visual mismatches where a label says `5.0` but the underlying break is `4.98`.
+- **Contiguous Legend Labels:** Formats labels as non-overlapping `(x, y]` intervals with exactly 1 decimal place (e.g., `4.2 - 5.0`, `5.1 - 6.7`). Legend displays in descending order.
+- **Color Ramp Application:** Pulls the "Prediction" color ramp from the project's ArcGIS Colors style and uses a hybrid `arcpy.mp` + CIM approach to ensure Pro generates the colors correctly while locking in custom bounds and labels.
+- **Layer Blend Mode:** Automatically sets the layer blend mode to `Multiply` via the CIM API to guarantee it sticks.
+- **Optional Map Export:** Can automatically toggle layer visibility and export high-resolution TIFFs for each element.
 
-## Requirements
+## Prerequisites
 
-- **ArcGIS Pro** (3.x recommended)
-- **Spatial Analyst Extension** (checked out automatically by the script)
-- **Python 3.x** (comes bundled with ArcGIS Pro)
-- **NumPy** (comes bundled with ArcGIS Pro)
-- A color ramp named **"Prediction"** available in the active ArcGIS Pro project's styles.
+1. **ArcGIS Pro:** This script relies on `arcpy` and must be run inside an open ArcGIS Pro project.
+2. **Spatial Analyst Extension:** Required for the IDW interpolation. The script checks out the extension automatically.
+3. **Input Data:** A point feature class containing the fields to interpolate.
+4. **Project Styles:** The "Prediction" color ramp must be available in the project's styles (it is included by default in ArcGIS Pro).
 
-## Configuration
+## Installation & Usage
 
-Before running the script, modify the following variables in the `Inputs and parameters` section to match your environment:
+1. Download or clone this repository.
+2. Open your ArcGIS Pro project.
+3. Open the **Python** pane or a Jupyter Notebook within ArcGIS Pro.
+4. Run the script.
+
+### Configuration
+
+Before running, modify the configuration block at the top of the script to match your environment:
 
 ```python
-IN_POINTS = "As mg/kg"          # Name of the input point feature layer
-Z_FIELDS = [...]                # List of fields to interpolate
-OUT_FOLDER = r"C:\path\to\outputraster" # Output directory for TIFFs
-OUT_CELL_SIZE = 50              # Output raster cell size
-POWER = 2                       # IDW power parameter
-SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None) # 12 nearest points
-IN_BARRIER = ""                 # Optional barrier polyline features
+# Path to your input point feature class
+IN_POINTS = "Your_Point_Layer_Name"
 
-PERCENTILES = [5, 25, 50, 75, 90, 95] # Percentiles for the 7 classes
-COLOR_RAMP_NAME = "Prediction"  # Must match a ramp in your Pro styles
+# List of fields to interpolate
+Z_FIELDS = ["As", "Ba", "Ca", "Cr", "Cu", "Fe", "Mn", "Ni", "Pb", "Rb", "Sr", "Ti", "V", "Zn"]
 
-RUN_IDW = True                  # False = apply symbology to existing rasters only
-EXPORT_LOG_MAPS = False         # True = export per-element TIFF maps
+# Output folder for the generated rasters
+OUT_FOLDER = r"C:\Path\To\Your\Output\Folder"
+
+# IDW Parameters
+OUT_CELL_SIZE = 50
+POWER = 2
+SEARCH_RADIUS = arcpy.sa.RadiusVariable(12, None)
+
+# Toggle phases
+RUN_IDW = True               # Set to False to only fix symbology on existing layers
+EXPORT_LOG_MAPS = False      # Set to True to also export per-element TIFFs
 ```
 
-### Geoprocessing Environment
-The script sets specific environment settings during execution:
-- **Extent:** `andros_gys` (Change this string to match your study area extent layer)
-- **Mask:** `andros_municipality_community` (Change this to your mask layer)
-- **Compression:** LZW
-- **Output Coordinate System:** Matches the active map's spatial reference.
+> **Note on Environment Variables:** The script includes specific environment settings (`extent`, `mask`, `cellSizeProjectionMethod`) hardcoded to specific layer names (e.g., `andros_gys`, `andros_municipality_community`). If your project uses different names for your extent/mask layers, update the `env_kwargs` dictionary in the `main()` function.
 
 ## How It Works
 
-The script runs in three distinct phases:
+### The Rounding Problem
+Python's built-in `round()` function uses banker's rounding (half-to-even), meaning `round(5.05, 1)` returns `5.0`. ArcGIS Pro's default UI rounding can also sometimes cause mismatches between displayed labels and actual data bounds.
 
-1. **Phase 1: IDW Interpolation** (If `RUN_IDW = True`)
-   - Iterates through the `Z_FIELDS`.
-   - Executes the `arcpy.sa.Idw` tool.
-   - Saves the output as `IDW_<Element>.tif` (e.g., `IDW_As.tif`).
-   - Calculates raster statistics.
+This script implements a custom `round_half_up()` function to ensure that `.05` always rounds up. 
 
-2. **Phase 2: Symbology Application**
-   - Extracts exact percentile breaks from `IN_POINTS` for the given field.
-   - Creates contiguous display labels using a custom `round_half_up` function (avoids Python's default banker's rounding so `5.05` correctly rounds to `5.1`).
-   - Applies the "Prediction" color ramp using standard `arcpy.mp` to force Pro to generate the 7 class colors.
-   - Dives into the layer's CIM definition to lock the exact float bounds, inject the custom labels, clear conflicting number formats, set the legend to descending order, and apply `Multiply` blend mode.
+### Classification & Label Generation
+1. The script reads the point data using `numpy` to calculate exact percentile breaks.
+2. The breaks are rounded using `round_half_up()`.
+3. Labels are generated as contiguous ranges. The lower bound of a class is always `previous_upper_bound + 0.1` to ensure no overlapping ranges.
 
-3. **Phase 3: Map Export** (If `EXPORT_LOG_MAPS = True`)
-   - Iterates through the elements, turning each layer on individually.
-   - Refreshes the active view.
-   - Exports the map to a TIFF file in the `log_maps` subfolder.
-   - Turns the layer off and proceeds to the next element.
-
-## How to Run
-
-1. Open **ArcGIS Pro** and load your project.
-2. Ensure your input point layer, extent layer, and mask layer are present in the active map.
-3. Open the **Python** pane (View -> Python).
-4. Paste the entire script into the Python pane, or load it via an external Python IDE configured with the ArcGIS Pro Python environment.
-5. Run the script. Check the console output for progress, success messages, or any fields that failed processing.
-
-## Technical Notes
-
-- **Banker's Rounding:** Python's built-in `round()` function uses "half-to-even" rounding (e.g., `round(5.05, 1)` returns `5.0`). This script uses a custom `round_half_up` math function to ensure standard rounding (`5.05` -> `5.1`) for the legend display.
-- **CIM API Quirk:** When setting manual classification via the CIM API, `classificationMethod` must be set to `"Manual"`. If `"ManualInterval"` is used, ArcGIS Pro silently defaults back to Defined Interval.
-- **Color Preservation:** The script uses `arcpy.mp` to set the color ramp first, which forces Pro to internally generate the hex colors for the 7 classes. The subsequent CIM pass only modifies the bounds and labels, preserving the generated colors perfectly.
+### Symbology Application
+Applying raster symbology via Python in ArcGIS Pro can be notoriously finicky. This script uses a two-step approach:
+1. **`arcpy.mp` API:** Sets the colorizer to `RasterClassifyColorizer`, applies the "Prediction" color ramp, and sets the break count. This forces Pro to internally generate the 7 colors.
+2. **CIM API:** Accesses the layer's definition (`V2`) to forcefully lock the `upperBound` values, `minimumBreak`, custom labels, and the `Multiply` blend mode—while preserving the colors Pro generated in step 1.
