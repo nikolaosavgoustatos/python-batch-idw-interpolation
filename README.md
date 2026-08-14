@@ -75,7 +75,3 @@ Labels are formatted as contiguous, non-overlapping ranges `(x, y]`:
 5.9 - 7.5
 5.4 - 5.8
 ```
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. (Or choose your preferred license).
