@@ -22,6 +22,10 @@ Legend:
 Layer Blend:
     Multiply (applied via CIM to guarantee it sticks).
 
+Layer Names:
+    Each element's layer is named "<Element> mg/kg" (e.g., "As mg/kg", "Ba mg/kg").
+    The symbology field label is also set to "<Element> mg/kg" instead of "Value".
+
 Set RUN_IDW = False to re-apply symbology only on existing layers/rasters.
 Set EXPORT_LOG_MAPS = True to also export per-element TIFFs.
 Run inside ArcGIS Pro (CURRENT project must be open).
@@ -156,10 +160,21 @@ def get_prediction_ramp(force_refresh=False):
 
 
 # ---------------------------------------------------------------------------
-# Path helpers
+# Path / name helpers
 # ---------------------------------------------------------------------------
 def raster_path_for_field(field):
+    """File path for the raster on disk (keeps IDW_ prefix, no spaces/slashes)."""
     return os.path.join(OUT_FOLDER, f"IDW_{field}.tif")
+
+
+def layer_name_for_field(field):
+    """Map layer name shown in the TOC — uses '<Element> mg/kg' format."""
+    return f"{field} mg/kg"
+
+
+def symbology_field_for_field(field):
+    """Field label shown in the symbology pane — '<Element> mg/kg' instead of 'Value'."""
+    return f"{field} mg/kg"
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +244,7 @@ def find_map_layer(active_map, layer_name):
 
 
 def ensure_layer_on_map(active_map, field, raster_path):
-    layer_name = f"IDW_{field}"
+    layer_name = layer_name_for_field(field)
     layer = find_map_layer(active_map, layer_name)
     if layer:
         return layer
@@ -245,12 +260,15 @@ def ensure_layer_on_map(active_map, field, raster_path):
     return layer
 
 
-def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES):
+def apply_symbology(layer, raster_path, breaks, labels, field_label, num_classes=NUM_CLASSES):
     """Apply classified symbology to a raster layer.
 
     Break VALUES (minimumBreak + each upperBound) are rounded with round_half_up()
     — the SAME rounding used for the labels — so the classification values
     and display text are fully consistent.
+
+    ``field_label`` is used as the colorizer field (e.g. "As mg/kg" instead of
+    "Value") so the TOC/symbology pane shows the element name.
     """
     ramp = get_prediction_ramp()
 
@@ -266,7 +284,7 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
             layer.symbology = sym
             sym = layer.symbology
         try:
-            sym.colorizer.field = "Value"
+            sym.colorizer.field = field_label
             sym.colorizer.classificationMethod = "ManualInterval"
             sym.colorizer.colorRamp = ramp
             sym.colorizer.breakCount = num_classes
@@ -293,7 +311,7 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
     # Do NOT use "ManualInterval" here, or Pro will default to Defined Interval.
     colorizer.classBreakType = "ClassBreaks"
     colorizer.classificationMethod = "Manual"
-    colorizer.field = "Value"
+    colorizer.field = field_label
     # minimumBreak uses the SAME rounded value as the first label's lower bound
     colorizer.minimumBreak = float(rounded_breaks[0])
     colorizer.showInAscendingOrder = False
@@ -327,7 +345,8 @@ def apply_symbology(layer, raster_path, breaks, labels, num_classes=NUM_CLASSES)
 
 def apply_symbology_for_field(active_map, field, breaks, labels):
     raster_path = raster_path_for_field(field)
-    layer_name = f"IDW_{field}"
+    layer_name = layer_name_for_field(field)
+    field_label = symbology_field_for_field(field)
 
     if not os.path.exists(raster_path):
         raise FileNotFoundError(f"Missing raster: {raster_path}")
@@ -337,7 +356,7 @@ def apply_symbology_for_field(active_map, field, breaks, labels):
     last_exc = None
     for attempt in (1, 2):
         try:
-            apply_symbology(layer, raster_path, breaks, labels)
+            apply_symbology(layer, raster_path, breaks, labels, field_label)
         except Exception as exc:
             last_exc = exc
             print(f"    {layer_name}: attempt {attempt} raised: {exc}")
@@ -366,7 +385,7 @@ def export_element_maps(active_map, output_folder):
 
     # Hide all element layers first
     for field in Z_FIELDS:
-        layer = find_map_layer(active_map, f"IDW_{field}")
+        layer = find_map_layer(active_map, layer_name_for_field(field))
         if layer:
             layer.visible = False
 
@@ -378,7 +397,8 @@ def export_element_maps(active_map, output_folder):
 
     failed = []
     for field in Z_FIELDS:
-        layer_name = f"IDW_{field}"
+        layer_name = layer_name_for_field(field)
+        field_label = symbology_field_for_field(field)
         raster_path = raster_path_for_field(field)
         if not os.path.exists(raster_path):
             print(f"  {layer_name}: raster missing - skipping")
@@ -400,7 +420,7 @@ def export_element_maps(active_map, output_folder):
             # Ensure symbology is locked (in case map reverted it)
             breaks = get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
             labels = build_class_labels(breaks)
-            apply_symbology(layer, raster_path, breaks, labels)
+            apply_symbology(layer, raster_path, breaks, labels, field_label)
 
             if active_view:
                 try:
@@ -408,7 +428,8 @@ def export_element_maps(active_map, output_folder):
                 except Exception:
                     pass
 
-            out_tiff = os.path.join(export_subfolder, f"{layer_name}_log.tif")
+            # Use field name (not layer name) for the file to avoid "/" in path
+            out_tiff = os.path.join(export_subfolder, f"IDW_{field}_log.tif")
             if active_view and active_view.type == "MAP_VIEW":
                 active_view.exportToTIFF(
                     out_tiff,
@@ -510,7 +531,7 @@ def main():
             # Phase 2: Percentile symbology on map layers
             print("\nPhase 2: Applying percentile (Prediction) symbology to all layers...")
             for field in Z_FIELDS:
-                layer_name = f"IDW_{field}"
+                layer_name = layer_name_for_field(field)
                 try:
                     breaks = get_percentile_breaks_from_points(IN_POINTS, field, PERCENTILES)
                     labels = build_class_labels(breaks)
